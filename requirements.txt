@@ -2,7 +2,8 @@ streamlit>=1.46
 pandas>=2.2
 sqlalchemy>=2.0
 psycopg2-binary>=2.9
-passlib[bcrypt]>=1.7
+passlib==1.7.4
+bcrypt==4.0.1
 requests>=2.32
 beautifulsoup4>=4.12
 odfpy>=1.4
