@@ -8,6 +8,7 @@ from passlib.context import CryptContext
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 ALGORITHM = "HS256"
+BCRYPT_MAX_BYTES = 72
 
 
 def secret_key() -> str:
@@ -17,12 +18,24 @@ def secret_key() -> str:
         return os.getenv("SECRET_KEY", "dev-secret-change-me")
 
 
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+def _bcrypt_safe_password(password: object) -> str:
+    """Normaliza senha para o limite aceito pelo bcrypt.
+
+    O bcrypt aceita no maximo 72 bytes. Em ambientes Streamlit/Supabase,
+    erros de colagem em Secrets podem inserir strings longas; esta funcao
+    evita que o app caia e limita de forma deterministica antes do hash.
+    """
+    value = "" if password is None else str(password)
+    encoded = value.encode("utf-8")[:BCRYPT_MAX_BYTES]
+    return encoded.decode("utf-8", errors="ignore")
 
 
-def verify_password(password: str, hashed: str) -> bool:
-    return pwd_context.verify(password, hashed)
+def hash_password(password: object) -> str:
+    return pwd_context.hash(_bcrypt_safe_password(password))
+
+
+def verify_password(password: object, hashed: str) -> bool:
+    return pwd_context.verify(_bcrypt_safe_password(password), hashed)
 
 
 def create_token(subject: str, minutes: int = 480) -> str:

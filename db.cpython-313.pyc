@@ -1,0 +1,10 @@
+DATABASE_URL = "postgresql://postgres.xxxxx:SUA-SENHA@aws-0-sa-east-1.pooler.supabase.com:6543/postgres?sslmode=require"
+SECRET_KEY = "troque-por-uma-chave-grande"
+ADMIN_EMAIL = "admin@tre-ba.jus.br"
+ADMIN_PASSWORD = "troque-esta-senha"
+APP_BASE_URL = "https://seu-app.streamlit.app"
+SMTP_HOST = ""
+SMTP_PORT = 587
+SMTP_USER = ""
+SMTP_PASSWORD = ""
+EMAIL_REMETENTE = ""

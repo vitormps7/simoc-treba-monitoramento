@@ -227,7 +227,7 @@ def bootstrap_minimo():
                     insert into usuarios (nome, email, senha_hash, perfil_id, ativo, validado, secao_operador)
                     values (:nome, :email, :senha, :perfil_id, true, true, :secao)
                 """),
-                {"nome": "Administrador", "email": normalizar_email(admin_email), "senha": hash_password(admin_password), "perfil_id": perfil_id, "secao": UNIDADE_CORREGEDORIA},
+                {"nome": "Administrador", "email": normalizar_email(admin_email), "senha": hash_password(str(admin_password)[:72]), "perfil_id": perfil_id, "secao": UNIDADE_CORREGEDORIA},
             )
 
 
@@ -302,7 +302,7 @@ def processar_recuperacao():
             st.warning("As senhas não conferem.")
         else:
             with db_session() as conn:
-                conn.execute(text("update usuarios set senha_hash=:h, token_recuperacao=null, token_recuperacao_expira_em=null, atualizado_em=now() where id=:id"), {"h": hash_password(nova), "id": row["id"]})
+                conn.execute(text("update usuarios set senha_hash=:h, token_recuperacao=null, token_recuperacao_expira_em=null, atualizado_em=now() where id=:id"), {"h": hash_password(str(nova)[:72]), "id": row["id"]})
             registrar_auditoria("recuperacao_senha", "usuarios", row["id"], detalhe=row["email"])
             st.success("Senha redefinida com sucesso. Faça login novamente.")
     return True
@@ -381,7 +381,7 @@ def login_box():
                             values (:nome, :email, :senha, :perfil, :zona, true, false, :token, :secao)
                             returning id
                             """),
-                            {"nome": nome.strip(), "email": email, "senha": hash_password(senha), "perfil": perfil_id, "zona": zona_id, "token": token, "secao": UNIDADE_CORREGEDORIA},
+                            {"nome": nome.strip(), "email": email, "senha": hash_password(str(senha)[:72]), "perfil": perfil_id, "zona": zona_id, "token": token, "secao": UNIDADE_CORREGEDORIA},
                         )
                         user_id = result.scalar_one()
                         link = gerar_link_validacao(token)
@@ -743,7 +743,7 @@ def page_usuarios():
                         insert into usuarios (nome, email, cpf, senha_hash, perfil_id, zona_eleitoral_id, ativo, validado, secao_operador, atualizado_em)
                         values (:nome, :email, :cpf, :senha, :perfil, :zona, :ativo, :validado, :secao, now())
                         on conflict (email) do update set nome=excluded.nome, cpf=excluded.cpf, senha_hash=excluded.senha_hash, perfil_id=excluded.perfil_id, zona_eleitoral_id=excluded.zona_eleitoral_id, ativo=excluded.ativo, validado=excluded.validado, atualizado_em=now()
-                    """), {"nome": nome, "email": email, "cpf": cpf or None, "senha": hash_password(senha), "perfil": perfil_id, "zona": zona_id, "ativo": ativo, "validado": validado, "secao": UNIDADE_CORREGEDORIA})
+                    """), {"nome": nome, "email": email, "cpf": cpf or None, "senha": hash_password(str(senha)[:72]), "perfil": perfil_id, "zona": zona_id, "ativo": ativo, "validado": validado, "secao": UNIDADE_CORREGEDORIA})
                 registrar_auditoria("salvar_usuario", "usuarios", detalhe=email)
                 st.success("Usuário criado/atualizado.")
     with abas[1]:
