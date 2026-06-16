@@ -644,6 +644,27 @@ def registrar_municipios_sede_no_sistema(conn) -> tuple[int, int]:
     return aplicar_zonas_padrao(conn, usar_tabela_local=True, sobrescrever_municipio=False)
 
 
+def garantir_grupos_padrao(conn) -> None:
+    """Garante grupos iniciais, mas permite que a Corregedoria crie e edite outros."""
+    for nome in GRUPOS_PADRAO:
+        conn.execute(text("""
+            insert into simoc_grupos (nome, ativo)
+            values (:nome, true)
+            on conflict (nome) do nothing
+        """), {"nome": nome})
+
+
+def grupo_options(incluir_todos: bool = False) -> list[str]:
+    try:
+        gs = rows("select nome from simoc_grupos where ativo=true order by nome")
+        opts = [g["nome"] for g in gs]
+    except Exception:
+        opts = GRUPOS_PADRAO[:]
+    if not opts:
+        opts = GRUPOS_PADRAO[:]
+    return (["Todos"] if incluir_todos else []) + opts
+
+
 # ============================================================
 # BANCO / SCHEMA
 # ============================================================
@@ -693,6 +714,16 @@ def bootstrap_schema_once() -> bool:
             exige_evidencia boolean default false,
             ativa boolean default true,
             criado_por integer references simoc_usuarios(id),
+            criado_em timestamptz default now(),
+            atualizado_em timestamptz default now()
+        );
+        """))
+        conn.execute(text("""
+        create table if not exists simoc_grupos (
+            id serial primary key,
+            nome text unique not null,
+            descricao text,
+            ativo boolean default true,
             criado_em timestamptz default now(),
             atualizado_em timestamptz default now()
         );
@@ -767,6 +798,7 @@ def bootstrap_schema_once() -> bool:
         # Zonas base: garante 001-205 e e-mail institucional padronizado.
         # Não consulta internet no carregamento; município-sede vem da tabela local/editável.
         registrar_municipios_sede_no_sistema(conn)
+        garantir_grupos_padrao(conn)
         # Admin inicial
         admin_email = normalizar_email(get_secret("ADMIN_EMAIL", ""))
         admin_password = get_secret("ADMIN_PASSWORD", "")
@@ -1156,12 +1188,12 @@ def df_checklists_filtrado(status="Todos", periodicidade="Todas", grupo="Todos",
 # ============================================================
 
 def pagina_inicio_corregedoria():
-    st.markdown("<div class='flow-box'><b>Fluxo correto:</b> a Corregedoria cadastra a atividade e a periodicidade → gera checklist para as Zonas → a Zona informa o responsável, observa e marca a realização → a Corregedoria acompanha, alerta e valida.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='flow-box'><b>Fluxo correto:</b> a Corregedoria cadastra grupos e atividades → define periodicidade, período e prazo → gera checklist para as Zonas → a Zona informa o responsável, marca a realização e registra observações → a Corregedoria acompanha no dashboard gerencial, alerta, comunica, valida ou devolve.</div>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns(3)
     with col1:
-        action_card("📌 Atividades monitoradas", "Cadastrar a atividade, periodicidade, período de execução e prazo para resposta das Zonas.", "Abrir atividades", "Atividades", button_key="home_atividades")
+        action_card("📌 Atividades e grupos", "Criar grupos, editar grupos, cadastrar atividades e gerar checklists para as Zonas.", "Abrir atividades", "Atividades", button_key="home_atividades")
     with col2:
-        action_card("📊 Acompanhamento", "Controlar atividades pendentes, realizadas, em análise e atrasadas por Zona Eleitoral.", "Abrir acompanhamento", "Acompanhamento", button_key="home_acomp")
+        action_card("📊 Dashboard gerencial", "Ver indicadores, atrasos, cumprimento por Zona e situação por grupo/periodicidade.", "Abrir dashboard", "Dashboard", button_key="home_dash")
     with col3:
         action_card("✉️ Comunicação", "Enviar mensagens às Zonas, inclusive orientações e cobranças de atraso.", "Abrir mensagens", "Mensagens", button_key="home_msg")
     col4, col5, col6 = st.columns(3)
@@ -1170,23 +1202,74 @@ def pagina_inicio_corregedoria():
     with col5:
         action_card("📄 Relatórios", "Filtrar por Zona, status, periodicidade, grupo e período. Exportar Excel ou PDF.", "Emitir relatórios", "Relatórios", button_key="home_rel")
     with col6:
-        action_card("💾 Backup", "Gerar backup completo do sistema em JSON e restaurar apenas com confirmação expressa.", "Abrir backup", "Backup", button_key="home_backup")
-
+        action_card("💾 Backup", "Gerar backup completo do sistema em JSON.", "Abrir backup", "Backup", button_key="home_backup")
 
 def pagina_atividades():
     st.subheader("Atividades monitoradas e geração de checklist")
-    st.caption("Cadastre a atividade, defina periodicidade e período. Ao salvar, o sistema gera o checklist para todas as Zonas ou para uma Zona específica.")
+    st.caption("A Corregedoria cadastra grupos e atividades. O responsável pela execução é sempre preenchido pela Zona no módulo da Zona.")
+
+    with st.expander("🗂️ Gerenciar grupos de atividades", expanded=False):
+        st.write("Crie novos grupos ou edite os grupos existentes. Esses grupos serão usados no cadastro de atividades e nos filtros do dashboard/relatórios.")
+        with st.form("form_novo_grupo"):
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                novo_grupo = st.text_input("Novo grupo", placeholder="Ex.: SISTEMAS JUDICIAIS")
+            with c2:
+                desc_grupo = st.text_input("Descrição opcional")
+            salvar_grupo = st.form_submit_button("Criar grupo", type="primary")
+        if salvar_grupo:
+            nome = novo_grupo.strip().upper()
+            if not nome:
+                st.warning("Informe o nome do grupo.")
+            else:
+                execute("""
+                    insert into simoc_grupos (nome, descricao, ativo)
+                    values (:nome, :descricao, true)
+                    on conflict (nome) do update set descricao=excluded.descricao, ativo=true, atualizado_em=now()
+                """, {"nome": nome, "descricao": desc_grupo.strip()})
+                registrar_auditoria("criar_grupo", "simoc_grupos", detalhe=nome)
+                st.success("Grupo salvo.")
+                st.rerun()
+
+        grupos = dataframe("select id, nome, descricao, ativo from simoc_grupos order by nome")
+        if not grupos.empty:
+            st.dataframe(grupos, use_container_width=True, hide_index=True)
+            with st.form("form_editar_grupo"):
+                opts = [f"{int(r.id)} | {r.nome}" for _, r in grupos.iterrows()]
+                escolha = st.selectbox("Grupo para editar", opts)
+                gid = int(escolha.split("|",1)[0].strip())
+                atual = grupos[grupos["id"] == gid].iloc[0]
+                nome_edit = st.text_input("Nome do grupo", value=str(atual["nome"]))
+                desc_edit = st.text_input("Descrição", value=str(atual.get("descricao") or ""))
+                ativo_edit = st.checkbox("Ativo", value=bool(atual["ativo"]))
+                salvar_edit = st.form_submit_button("Salvar edição do grupo")
+            if salvar_edit:
+                nome = nome_edit.strip().upper()
+                if not nome:
+                    st.warning("O nome do grupo não pode ficar vazio.")
+                else:
+                    execute("""
+                        update simoc_grupos set nome=:nome, descricao=:descricao, ativo=:ativo, atualizado_em=now()
+                        where id=:id
+                    """, {"nome": nome, "descricao": desc_edit.strip(), "ativo": ativo_edit, "id": gid})
+                    execute("update simoc_atividades set grupo=:novo where grupo=:antigo", {"novo": nome, "antigo": str(atual["nome"])})
+                    registrar_auditoria("editar_grupo", "simoc_grupos", gid, nome)
+                    st.success("Grupo atualizado.")
+                    st.rerun()
+
+    st.markdown("---")
+    st.subheader("Cadastrar atividade e gerar checklist")
     with st.form("form_nova_atividade"):
         c1, c2 = st.columns([1, 2])
         with c1:
-            grupo = st.selectbox("Grupo", GRUPOS_PADRAO)
+            grupo = st.selectbox("Grupo", grupo_options())
             periodicidade = st.selectbox("Periodicidade", PERIODICIDADES)
             prazo_dias = st.number_input("Prazo padrão em dias", min_value=0, max_value=365, value=5)
             exige_evidencia = st.checkbox("Exigir link/evidência")
         with c2:
             descricao = st.text_area("Atividade a ser monitorada", placeholder="Ex.: RAE em diligência; Banco de Erros; PJe; Diário DJE...")
-            responsavel_ref = st.text_input("Responsável de referência da planilha", placeholder="Ex.: Emerson e Rosy; Juanil e Marcelo")
             orientacao = st.text_area("Orientação da Corregedoria para a Zona")
+            st.info("O responsável pela atividade será informado pela própria Zona no momento de realizar o checklist.")
         st.markdown("**Período de execução e prazo para resposta**")
         d1, d2, d3, d4 = st.columns(4)
         with d1:
@@ -1207,9 +1290,9 @@ def pagina_atividades():
             uid = (usuario_logado() or {}).get("id")
             aid = scalar("""
                 insert into simoc_atividades (grupo, descricao, periodicidade, responsavel_referencia, prazo_dias, orientacao, exige_evidencia, criado_por)
-                values (:grupo, :descricao, :periodicidade, :resp, :prazo_dias, :orientacao, :exige, :uid)
+                values (:grupo, :descricao, :periodicidade, null, :prazo_dias, :orientacao, :exige, :uid)
                 returning id
-            """, {"grupo": grupo, "descricao": descricao.strip(), "periodicidade": periodicidade, "resp": responsavel_ref.strip(), "prazo_dias": int(prazo_dias), "orientacao": orientacao.strip(), "exige": exige_evidencia, "uid": uid})
+            """, {"grupo": grupo, "descricao": descricao.strip(), "periodicidade": periodicidade, "prazo_dias": int(prazo_dias), "orientacao": orientacao.strip(), "exige": exige_evidencia, "uid": uid})
             qtd = gerar_checklists(aid, zona_id_from_label(destino), inicio, fim, prazo)
             registrar_auditoria("cadastrar_atividade", "simoc_atividades", aid, descricao[:120])
             st.success(f"Atividade cadastrada e checklist gerado para {qtd} Zona(s).")
@@ -1217,12 +1300,42 @@ def pagina_atividades():
     st.markdown("---")
     st.subheader("Atividades cadastradas")
     df = dataframe("""
-        select id, grupo, descricao, periodicidade, responsavel_referencia, prazo_dias, ativa, criado_em
+        select id, grupo, descricao, periodicidade, prazo_dias, ativa, criado_em
         from simoc_atividades order by criado_em desc
     """)
     if not df.empty:
         df["criado_em"] = df["criado_em"].apply(fmt_data)
     st.dataframe(df, use_container_width=True, hide_index=True)
+
+    with st.expander("Editar atividade cadastrada"):
+        atividades_edit = rows("select id, grupo, descricao, periodicidade, prazo_dias, orientacao, exige_evidencia, ativa from simoc_atividades order by descricao")
+        if atividades_edit:
+            opts = [f"{a['id']} | {a['descricao']}" for a in atividades_edit]
+            with st.form("form_editar_atividade"):
+                escolha = st.selectbox("Atividade", opts)
+                aid = int(escolha.split("|",1)[0].strip())
+                atual = next(a for a in atividades_edit if int(a["id"]) == aid)
+                gopts = grupo_options()
+                grupo_e = st.selectbox("Grupo", gopts, index=gopts.index(atual.get("grupo")) if atual.get("grupo") in gopts else 0)
+                periodicidade_e = st.selectbox("Periodicidade", PERIODICIDADES, index=PERIODICIDADES.index(atual.get("periodicidade")) if atual.get("periodicidade") in PERIODICIDADES else 0)
+                descricao_e = st.text_area("Descrição", value=atual.get("descricao") or "")
+                orientacao_e = st.text_area("Orientação", value=atual.get("orientacao") or "")
+                c1, c2, c3 = st.columns(3)
+                with c1: prazo_e = st.number_input("Prazo padrão em dias", min_value=0, max_value=365, value=int(atual.get("prazo_dias") or 5))
+                with c2: exige_e = st.checkbox("Exigir evidência", value=bool(atual.get("exige_evidencia")))
+                with c3: ativa_e = st.checkbox("Ativa", value=bool(atual.get("ativa")))
+                salvar_atv = st.form_submit_button("Salvar atividade")
+            if salvar_atv:
+                execute("""
+                    update simoc_atividades set grupo=:grupo, descricao=:descricao, periodicidade=:periodicidade,
+                    prazo_dias=:prazo, orientacao=:orientacao, exige_evidencia=:exige, ativa=:ativa, atualizado_em=now()
+                    where id=:id
+                """, {"grupo": grupo_e, "descricao": descricao_e.strip(), "periodicidade": periodicidade_e, "prazo": int(prazo_e), "orientacao": orientacao_e.strip(), "exige": exige_e, "ativa": ativa_e, "id": aid})
+                registrar_auditoria("editar_atividade", "simoc_atividades", aid, descricao_e[:120])
+                st.success("Atividade atualizada.")
+                st.rerun()
+        else:
+            st.info("Nenhuma atividade cadastrada.")
 
     with st.expander("Gerar novo período de checklist para atividade já cadastrada"):
         atividades = rows("select id, descricao, periodicidade from simoc_atividades where ativa=true order by descricao")
@@ -1243,28 +1356,69 @@ def pagina_atividades():
         else:
             st.info("Nenhuma atividade cadastrada.")
 
-
-def pagina_acompanhamento():
+def pagina_dashboard_gerencial():
+    st.subheader("Dashboard gerencial")
+    st.caption("Visão gerencial para a Corregedoria acompanhar cumprimento, atrasos, validações, desempenho por Zona e evolução por grupo.")
     criadas = gerar_mensagens_atraso_automaticas()
     if criadas:
         alert("warn", f"Foram geradas {criadas} mensagem(ns) automática(s) de atraso para as Zonas.")
+
     total = scalar("select count(*) from simoc_checklists") or 0
     pend = scalar("select count(*) from simoc_checklists where status='pendente'") or 0
     analise = scalar("select count(*) from simoc_checklists where status='em_analise'") or 0
     valid = scalar("select count(*) from simoc_checklists where status='validado'") or 0
+    devolv = scalar("select count(*) from simoc_checklists where status='devolvido'") or 0
     atras = scalar("select count(*) from simoc_checklists where status in ('pendente','devolvido') and prazo_preenchimento < :h", {"h": hoje_brasilia()}) or 0
-    c1,c2,c3,c4,c5 = st.columns(5)
+    taxa = round((valid / total) * 100, 1) if total else 0
+
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
     with c1: metric_card("Total", total)
     with c2: metric_card("Pendentes", pend)
     with c3: metric_card("Em análise", analise)
     with c4: metric_card("Validados", valid)
-    with c5: metric_card("Atrasados", atras)
+    with c5: metric_card("Devolvidos", devolv)
+    with c6: metric_card("Atrasados", atras)
+    st.progress(min(taxa/100, 1.0), text=f"Taxa de validação: {taxa}%")
+
     if atras:
         alert("danger", f"Há {atras} checklist(s) em atraso. As Zonas recebem alerta automático e a Corregedoria pode enviar mensagem manual.")
-    st.subheader("Controle de realização por Zona")
-    df = df_checklists_filtrado()
+
+    st.markdown("---")
+    f1, f2, f3, f4 = st.columns(4)
+    with f1: status = st.selectbox("Status", ["Todos"] + STATUS_CHECKLIST, key="dash_status")
+    with f2: periodicidade = st.selectbox("Periodicidade", ["Todas"] + PERIODICIDADES, key="dash_period")
+    with f3: grupo = st.selectbox("Grupo", grupo_options(incluir_todos=True), key="dash_grupo")
+    with f4: zlabel = st.selectbox("Zona", zona_options(incluir_todas=True), key="dash_zona")
+    zid = zona_id_from_label(zlabel)
+    df = df_checklists_filtrado(status, periodicidade, grupo, zid)
+
+    st.markdown("### Indicadores por status")
+    if not df.empty:
+        status_df = df.groupby("status").size().reset_index(name="quantidade")
+        st.bar_chart(status_df, x="status", y="quantidade", use_container_width=True)
+    else:
+        st.info("Nenhum registro para os filtros selecionados.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("### Cumprimento por grupo")
+        if not df.empty:
+            gdf = df.groupby(["grupo", "status"]).size().reset_index(name="quantidade")
+            st.dataframe(gdf, use_container_width=True, hide_index=True)
+    with c2:
+        st.markdown("### Zonas com maior atenção")
+        if not df.empty:
+            base = df.copy()
+            base["atenção"] = base["status"].isin(["pendente", "devolvido"]).astype(int)
+            zdf = base.groupby(["zona", "municipio_sede"])["atenção"].sum().reset_index().sort_values("atenção", ascending=False).head(15)
+            st.dataframe(zdf, use_container_width=True, hide_index=True)
+
+    st.markdown("### Controle detalhado")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
+
+def pagina_acompanhamento():
+    pagina_dashboard_gerencial()
 
 def pagina_validacao():
     st.subheader("Validar checklists enviados pelas Zonas")
@@ -1485,7 +1639,7 @@ def pagina_relatorios():
     c1,c2,c3,c4,c5,c6 = st.columns(6)
     with c1: status = st.selectbox("Status", ["Todos"] + STATUS_CHECKLIST)
     with c2: periodicidade = st.selectbox("Periodicidade", ["Todas"] + PERIODICIDADES)
-    with c3: grupo = st.selectbox("Grupo", ["Todos"] + GRUPOS_PADRAO)
+    with c3: grupo = st.selectbox("Grupo", grupo_options(incluir_todos=True))
     with c4: zlabel = st.selectbox("Zona", zona_options(incluir_todas=True))
     with c5: inicio = st.date_input("Início", value=None, format="DD/MM/YYYY")
     with c6: fim = st.date_input("Fim", value=None, format="DD/MM/YYYY")
@@ -1642,11 +1796,11 @@ def pagina_mensagens_zona():
 # ============================================================
 
 def app_corregedoria():
-    paginas = ["Início", "Atividades", "Acompanhamento", "Validação", "Mensagens", "Zonas", "Relatórios", "Usuários", "Backup", "Auditoria"]
+    paginas = ["Início", "Atividades", "Dashboard", "Validação", "Mensagens", "Zonas", "Relatórios", "Usuários", "Backup", "Auditoria"]
     pagina = nav(paginas, "nav_cor")
     if pagina == "Início": pagina_inicio_corregedoria()
     elif pagina == "Atividades": pagina_atividades()
-    elif pagina == "Acompanhamento": pagina_acompanhamento()
+    elif pagina == "Dashboard": pagina_dashboard_gerencial()
     elif pagina == "Validação": pagina_validacao()
     elif pagina == "Mensagens": pagina_mensagens_corregedoria()
     elif pagina == "Zonas": pagina_zonas()
