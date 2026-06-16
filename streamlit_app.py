@@ -329,17 +329,44 @@ def hoje_brasilia() -> date:
 
 
 def fmt_data(v: Any) -> str:
+    """Formata datas com tolerância a valores nulos, NaT e textos.
+
+    Em algumas consultas o pandas recebe campos timestamptz como Timestamp/NaT.
+    O NaT causava erro ao chamar astimezone/strftime na tela Usuários.
+    """
     if v is None or v == "":
         return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
     if isinstance(v, str):
+        texto = v.strip()
+        if not texto or texto.lower() in {"nat", "none", "null"}:
+            return ""
         try:
-            v = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            v = datetime.fromisoformat(texto.replace("Z", "+00:00"))
         except Exception:
-            return v
+            return texto
+    if isinstance(v, pd.Timestamp):
+        if pd.isna(v):
+            return ""
+        v = v.to_pydatetime()
     if isinstance(v, datetime):
-        return v.astimezone(FUSO_HORARIO_BRASILIA).strftime("%d/%m/%Y %H:%M")
+        try:
+            if v.tzinfo is None:
+                v = v.replace(tzinfo=FUSO_HORARIO_BRASILIA)
+            else:
+                v = v.astimezone(FUSO_HORARIO_BRASILIA)
+            return v.strftime("%d/%m/%Y %H:%M")
+        except Exception:
+            return ""
     if isinstance(v, date):
-        return v.strftime("%d/%m/%Y")
+        try:
+            return v.strftime("%d/%m/%Y")
+        except Exception:
+            return ""
     return str(v)
 
 
