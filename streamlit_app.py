@@ -62,9 +62,11 @@ st.markdown(
     .main-header p {margin: 3px 0; font-weight: 700;}
     .user-strip {background:#EEF6FF; border:1px solid #C8DAEF; color:#123E66; padding: 10px 14px; border-radius: 12px; margin-bottom: 16px; font-weight: 800;}
     .nav-box {background:#F7FAFE; border:1px solid #D8E3F0; padding:12px; border-radius:16px; margin-bottom:18px;}
-    .module-card {background:#FFFFFF; border:1px solid #CAD9EA; border-radius:14px; padding:22px 22px; min-height:142px; box-shadow:0 7px 16px rgba(15,47,82,.05);} 
-    .module-card h3 {margin:0 0 12px 0; color:#063B68; font-size:20px; font-weight:900;}
-    .module-card p {margin:0; color:#23384F; font-size:14px; line-height:1.45;}
+    .module-card {background:#FFFFFF; border:0; border-radius:14px; padding:0; min-height:122px;} 
+    .module-card h3 {margin:0 0 14px 0; color:#063B68; font-size:20px; font-weight:900;}
+    .module-card p {margin:0 0 18px 0; color:#23384F; font-size:14px; line-height:1.45;}
+    div[data-testid="stVerticalBlockBorderWrapper"] {border-color:#CAD9EA !important; border-radius:14px !important; box-shadow:0 7px 16px rgba(15,47,82,.05);}
+    div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stVerticalBlock"] {height:100%;}
     .flow-box {background:#0F3F67; color:white; border-radius:16px; padding:18px 22px; margin:12px 0 20px 0;}
     .flow-box b {color:white;}
     .metric-card {background:#fff; border:1px solid #D7E0EA; border-radius:14px; padding:16px; box-shadow:0 4px 12px rgba(15,47,82,.05);} 
@@ -402,17 +404,30 @@ def user_strip():
     st.markdown(f"<div class='user-strip'>Usuário: {u.get('nome')} · Perfil: {u.get('perfil')}{zona}</div>", unsafe_allow_html=True)
 
 
+def set_page(key: str, page: str):
+    st.session_state[key] = page
+
+
 def nav(paginas: list[str], key: str) -> str:
-    if key not in st.session_state:
+    if key not in st.session_state or st.session_state[key] not in paginas:
         st.session_state[key] = paginas[0]
+    widget_key = f"{key}_widget"
+    idx = paginas.index(st.session_state[key])
     st.markdown("<div class='nav-box'>", unsafe_allow_html=True)
-    pagina = st.radio("Navegação", paginas, horizontal=True, key=key, label_visibility="collapsed")
+    pagina = st.radio("Navegação", paginas, horizontal=True, index=idx, key=widget_key, label_visibility="collapsed")
     st.markdown("</div>", unsafe_allow_html=True)
+    st.session_state[key] = pagina
     return pagina
 
 
 def card(titulo: str, texto: str):
     st.markdown(f"<div class='module-card'><h3>{titulo}</h3><p>{texto}</p></div>", unsafe_allow_html=True)
+
+
+def action_card(titulo: str, texto: str, botao: str, destino: str, nav_key: str = "nav_cor", button_key: str | None = None):
+    with st.container(border=True):
+        card(titulo, texto)
+        st.button(botao, key=button_key or f"btn_{nav_key}_{destino}", on_click=set_page, args=(nav_key, destino))
 
 
 def metric_card(label: str, value: Any):
@@ -682,38 +697,20 @@ def df_checklists_filtrado(status="Todos", periodicidade="Todas", grupo="Todos",
 
 def pagina_inicio_corregedoria():
     st.markdown("<div class='flow-box'><b>Fluxo correto:</b> a Corregedoria cadastra a atividade e a periodicidade → gera checklist para as Zonas → a Zona informa o responsável, observa e marca a realização → a Corregedoria acompanha, alerta e valida.</div>", unsafe_allow_html=True)
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        card("📌 Atividades monitoradas", "Cadastrar a atividade, periodicidade, período de execução e prazo para resposta das Zonas.")
-        if st.button("Abrir atividades", key="home_atividades"):
-            st.session_state.nav_cor = "Atividades"
-            st.rerun()
-    with c2:
-        card("📊 Acompanhamento", "Controlar atividades pendentes, realizadas, em análise e atrasadas por Zona Eleitoral.")
-        if st.button("Abrir acompanhamento", key="home_acomp"):
-            st.session_state.nav_cor = "Acompanhamento"
-            st.rerun()
-    with c3:
-        card("✉️ Comunicação", "Enviar mensagens às Zonas, inclusive orientações e cobranças de atraso.")
-        if st.button("Abrir mensagens", key="home_msg"):
-            st.session_state.nav_cor = "Mensagens"
-            st.rerun()
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        card("✅ Validação", "Validar ou devolver os checklists enviados pelas Zonas.")
-        if st.button("Validar checklists", key="home_val"):
-            st.session_state.nav_cor = "Validação"
-            st.rerun()
-    with c5:
-        card("📄 Relatórios", "Filtrar por Zona, status, periodicidade, grupo e período. Exportar Excel ou PDF.")
-        if st.button("Emitir relatórios", key="home_rel"):
-            st.session_state.nav_cor = "Relatórios"
-            st.rerun()
-    with c6:
-        card("💾 Backup", "Gerar backup completo do sistema em JSON e restaurar apenas com confirmação expressa.")
-        if st.button("Abrir backup", key="home_backup"):
-            st.session_state.nav_cor = "Backup"
-            st.rerun()
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        action_card("📌 Atividades monitoradas", "Cadastrar a atividade, periodicidade, período de execução e prazo para resposta das Zonas.", "Abrir atividades", "Atividades", button_key="home_atividades")
+    with col2:
+        action_card("📊 Acompanhamento", "Controlar atividades pendentes, realizadas, em análise e atrasadas por Zona Eleitoral.", "Abrir acompanhamento", "Acompanhamento", button_key="home_acomp")
+    with col3:
+        action_card("✉️ Comunicação", "Enviar mensagens às Zonas, inclusive orientações e cobranças de atraso.", "Abrir mensagens", "Mensagens", button_key="home_msg")
+    col4, col5, col6 = st.columns(3)
+    with col4:
+        action_card("✅ Validação", "Validar ou devolver os checklists enviados pelas Zonas.", "Validar checklists", "Validação", button_key="home_val")
+    with col5:
+        action_card("📄 Relatórios", "Filtrar por Zona, status, periodicidade, grupo e período. Exportar Excel ou PDF.", "Emitir relatórios", "Relatórios", button_key="home_rel")
+    with col6:
+        action_card("💾 Backup", "Gerar backup completo do sistema em JSON e restaurar apenas com confirmação expressa.", "Abrir backup", "Backup", button_key="home_backup")
 
 
 def pagina_atividades():
@@ -1035,15 +1032,9 @@ def pagina_inicio_zona():
         alert("danger", "Há checklist em atraso. Regularize ou registre observação para a Corregedoria.")
     c1, c2 = st.columns(2)
     with c1:
-        card("✅ Checklist da Zona", "Visualizar atividades cadastradas pela Corregedoria, informar responsável local, marcar realização e registrar observações.")
-        if st.button("Abrir checklist", key="zona_home_check"):
-            st.session_state.nav_zona = "Checklist"
-            st.rerun()
+        action_card("✅ Checklist da Zona", "Visualizar atividades cadastradas pela Corregedoria, informar responsável local, marcar realização e registrar observações.", "Abrir checklist", "Checklist", nav_key="nav_zona", button_key="zona_home_check")
     with c2:
-        card("✉️ Mensagens da Corregedoria", "Ler orientações, alertas automáticos de atraso e comunicações enviadas pela Corregedoria.")
-        if st.button("Abrir mensagens", key="zona_home_msg"):
-            st.session_state.nav_zona = "Mensagens"
-            st.rerun()
+        action_card("✉️ Mensagens da Corregedoria", "Ler orientações, alertas automáticos de atraso e comunicações enviadas pela Corregedoria.", "Abrir mensagens", "Mensagens", nav_key="nav_zona", button_key="zona_home_msg")
 
 
 def pagina_checklist_zona():
