@@ -5,8 +5,10 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import smtplib
+import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
 from io import BytesIO
@@ -16,6 +18,13 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+
+try:
+    from bs4 import BeautifulSoup
+    BS4_OK = True
+except Exception:
+    BeautifulSoup = None
+    BS4_OK = False
 
 try:
     from reportlab.lib import colors
@@ -44,8 +53,231 @@ PERIODICIDADES = ["diariamente", "semanalmente", "quinzenalmente", "mensalmente"
 GRUPOS_PADRAO = ["ELO", "SISTEMAS DA INTRANET", "OBSERVAÇÕES", "OUTROS"]
 STATUS_CHECKLIST = ["pendente", "em_analise", "validado", "devolvido", "nao_realizado"]
 
-# Lista base: garante 001 a 205. Municipio-sede pode ser atualizado depois pela Corregedoria.
-ZONAS_PADRAO = [(i, f"{i:03d}ª Zona Eleitoral", "Município-sede não informado") for i in range(1, 206)]
+# Lista base: garante 001 a 205.
+# O e-mail institucional da zona segue o padrão zona001@tre-ba.jus.br, zona002@tre-ba.jus.br etc.
+# O município-sede é tratado como dado cadastral LOCAL, salvo no Supabase.
+# Assim o sistema não consulta a internet a cada carregamento.
+def email_padrao_zona(numero: int) -> str:
+    return f"zona{int(numero):03d}@tre-ba.jus.br"
+
+
+# Tabela fixa local de município-sede por Zona.
+# Tabela preenchida a partir da lista fornecida pelo usuário (ZONA ELEITORAL / município-sede).
+# A tela Zonas Eleitorais também permite importar CSV/XLSX e editar manualmente, gravando no Supabase.
+MUNICIPIOS_SEDE_FIXOS: dict[int, str] = {
+    1: "SALVADOR",
+    2: "SALVADOR",
+    3: "SALVADOR",
+    4: "SALVADOR",
+    5: "SALVADOR",
+    6: "SALVADOR",
+    7: "SALVADOR",
+    8: "SALVADOR",
+    9: "SALVADOR",
+    10: "SALVADOR",
+    11: "SALVADOR",
+    12: "SALVADOR",
+    13: "SALVADOR",
+    14: "SALVADOR",
+    15: "SALVADOR",
+    16: "SALVADOR",
+    17: "SALVADOR",
+    18: "SALVADOR",
+    19: "SALVADOR",
+    20: "Zona eleitoral extinta",
+    21: "ESPLANADA",
+    22: "JEQUIÉ",
+    23: "JEQUIÉ",
+    24: "IPIAÚ",
+    25: "ILHÉUS",
+    26: "ILHÉUS",
+    27: "ITABUNA",
+    28: "ITABUNA",
+    29: "IBICARAÍ",
+    30: "NAZARÉ",
+    31: "VALENÇA",
+    32: "ITUBERÁ",
+    33: "SIMÕES FILHO",
+    34: "BELMONTE",
+    35: "MUCURI",
+    36: "AMARGOSA",
+    37: "MARACÁS",
+    38: "UBAÍRA",
+    39: "VITÓRIA DA CONQUISTA",
+    40: "VITÓRIA DA CONQUISTA",
+    41: "VITÓRIA DA CONQUISTA",
+    42: "ITABERABA",
+    43: "CASTRO ALVES",
+    44: "INHAMBUPE",
+    45: "SENHOR DO BONFIM",
+    46: "JACOBINA",
+    47: "JUAZEIRO",
+    48: "JUAZEIRO",
+    49: "RIO REAL",
+    50: "MONTE SANTO",
+    51: "JEREMOABO",
+    52: "PARIPIRANGA",
+    53: "CAMPO FORMOSO",
+    54: "MUNDO NOVO",
+    55: "MORRO DO CHAPÉU",
+    56: "SANTO ANTÔNIO DE JESUS",
+    57: "MARAGOGIPE",
+    58: "ITUAÇU",
+    59: "POÇÕES",
+    60: "CONDEÚBA",
+    61: "CORIBE",
+    62: "IPIRÁ",
+    63: "CAETITÉ",
+    64: "GUANAMBI",
+    65: "MACAÚBAS",
+    66: "CASA NOVA",
+    67: "REMANSO",
+    68: "XIQUE-XIQUE",
+    69: "UTINGA",
+    70: "BARREIRAS",
+    71: "BOM JESUS DA LAPA",
+    72: "SANTA MARIA DA VITÓRIA",
+    73: "UBAITABA",
+    74: "IRARÁ",
+    75: "BARREIRAS",
+    76: "JAGUAQUARA",
+    77: "BARRA",
+    78: "CAMAMU",
+    79: "NOVA SOURE",
+    80: "TUCANO",
+    81: "OLINDINA",
+    82: "CÍCERO DANTAS",
+    83: "UAUÁ",
+    84: "PAULO AFONSO",
+    85: "CURAÇÁ",
+    86: "MAIRI",
+    87: "RUY BARBOSA",
+    88: "SEABRA",
+    89: "LENÇÓIS",
+    90: "BRUMADO",
+    91: "MACARANI",
+    92: "JACARACI",
+    93: "CACULÉ",
+    94: "OLIVEIRA DOS BREJINHOS",
+    95: "IRECÊ",
+    96: "SENTO SÉ",
+    97: "SANTA RITA DE CÁSSIA",
+    98: "COTEGIPE",
+    99: "SANTANA",
+    100: "SÃO DESIDÉRIO",
+    101: "LIVRAMENTO DE NOSSA SENHORA",
+    102: "EUCLIDES DA CUNHA",
+    103: "MIGUEL CALMON",
+    104: "LAPÃO",
+    105: "PIATÃ",
+    106: "QUEIMADAS",
+    107: "SANTA TERESINHA",
+    108: "SÃO GONÇALO DOS CAMPOS",
+    109: "MUTUÍPE",
+    110: "RIBEIRA DO POMBAL",
+    111: "PARAMIRIM",
+    112: "PRADO",
+    113: "RIACHO DE SANTANA",
+    114: "RIACHÃO DO JACUÍPE",
+    115: "SAÚDE",
+    116: "CANAVIEIRAS",
+    117: "URANDI",
+    118: "CACHOEIRA",
+    119: "ANDARAÍ",
+    120: "VALENTE",
+    121: "PORTO SEGURO",
+    122: "PORTO SEGURO",
+    123: "ARACI",
+    124: "CORRENTINA",
+    125: "CARINHANHA",
+    126: "BAIANÓPOLIS",
+    127: "CANDEIAS",
+    128: "SÃO SEBASTIÃO DO PASSÉ",
+    129: "CATU",
+    130: "CORAÇÃO DE MARIA",
+    131: "MURITIBA",
+    132: "CONCEIÇÃO DO COITÉ",
+    133: "CAMACAN",
+    134: "UBATÃ",
+    135: "COARACI",
+    136: "ITAJUÍPE",
+    137: "ITORORÓ",
+    138: "ITARANTIM",
+    139: "BARRA DO CHOÇA",
+    140: "ITAPETINGA",
+    141: "ITAPARICA",
+    142: "CRUZ DAS ALMAS",
+    143: "SANTO ESTEVÃO",
+    144: "ENTRE RIOS",
+    145: "SANTALUZ",
+    146: "IGUAÍ",
+    147: "ITAGIBÁ",
+    148: "ITANHÉM",
+    149: "ITIÚBA",
+    150: "SERRINHA",
+    151: "GANDU",
+    152: "ENCRUZILHADA",
+    153: "MEDEIROS NETO",
+    154: "FEIRA DE SANTANA",
+    155: "FEIRA DE SANTANA",
+    156: "FEIRA DE SANTANA",
+    157: "FEIRA DE SANTANA",
+    158: "CHORROCHÓ",
+    159: "CENTRAL",
+    160: "SANTA BÁRBARA",
+    161: "ANAGÉ",
+    162: "SÃO FRANCISCO DO CONDE",
+    163: "ALAGOINHAS",
+    164: "ALAGOINHAS",
+    165: "CÂNDIDO SALES",
+    166: "BUERAREMA",
+    167: "JACOBINA",
+    168: "IGAPORÃ",
+    169: "BARRA DA ESTIVA",
+    170: "CAMAÇARI",
+    171: "CAMAÇARI",
+    172: "ITAMARAJU",
+    173: "IBOTIRAMA",
+    174: "CANARANA",
+    175: "PALMAS DE MONTE ALTO",
+    176: "BARRA DO MENDES",
+    177: "TREMEDAL",
+    178: "SANTO AMARO",
+    179: "JAGUARARI",
+    180: "LAURO DE FREITAS",
+    181: "PAULO AFONSO",
+    182: "RIACHÃO DAS NEVES",
+    183: "TEIXEIRA DE FREITAS",
+    184: "SÃO FELIPE",
+    185: "MATA DE SÃO JOÃO",
+    186: "DIAS D'ÁVILA",
+    187: "FORMOSA DO RIO PRETO",
+    188: "EUNÁPOLIS",
+    189: "ITABELA",
+    190: "SERRA DOURADA",
+    191: "CAPIM GROSSO",
+    192: "CONCEIÇÃO DO JACUÍPE",
+    193: "IAÇU",
+    194: "SERRA PRETA",
+    195: "PILÃO ARCADO",
+    196: "RETIROLÂNDIA",
+    197: "WENCESLAU GUIMARÃES",
+    198: "URUÇUCA",
+    199: "JOÃO DOURADO",
+    200: "POJUCA",
+    201: "ITAMBÉ",
+    202: "SANTO ANTÔNIO DE JESUS",
+    203: "EUNÁPOLIS",
+    204: "LAURO DE FREITAS",
+    205: "LUÍS EDUARDO MAGALHÃES",
+}
+
+
+def sede_padrao_zona(numero: int) -> str:
+    return MUNICIPIOS_SEDE_FIXOS.get(int(numero), "Município-sede pendente de cadastro")
+
+
+ZONAS_PADRAO = [(i, f"{i:03d}ª Zona Eleitoral", sede_padrao_zona(i), email_padrao_zona(i)) for i in range(1, 206)]
 
 # ============================================================
 # ESTILO
@@ -186,6 +418,232 @@ def dataframe(sql: str, params: dict | None = None) -> pd.DataFrame:
     return pd.DataFrame(rows(sql, params))
 
 
+
+# ============================================================
+# ZONAS ELEITORAIS DA BAHIA
+# ============================================================
+
+PLACEHOLDERS_SEDE = {
+    "", None,
+    "Município-sede não informado",
+    "Município-sede pendente de atualização",
+    "Sede não informada",
+}
+
+
+def _baixar_html(url: str, timeout: int = 12) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 SIMOC-BA"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    for enc in ("utf-8", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            pass
+    return raw.decode("utf-8", errors="ignore")
+
+
+def _limpar_texto(valor: object) -> str:
+    txt = re.sub(r"\s+", " ", str(valor or "")).strip()
+    return txt.strip(" -–—|;,")
+
+
+def _extrair_numero_zona(valor: str) -> int | None:
+    m = re.search(r"\b(\d{1,3})\b", str(valor or ""))
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n if 1 <= n <= 205 else None
+
+
+def _indice_coluna(cabecalhos: list[str], termos: list[str]) -> int | None:
+    cab = [c.upper() for c in cabecalhos]
+    for i, c in enumerate(cab):
+        if all(t.upper() in c for t in termos):
+            return i
+    return None
+
+
+def extrair_zonas_tre_ba_html(html: str) -> dict[int, dict[str, str]]:
+    """Extrai zona -> município-sede/e-mail de páginas públicas do TRE-BA.
+
+    A página oficial pode mudar de layout. Por isso o parser aceita tabelas com cabeçalhos
+    ou linhas simples contendo número da zona, município-sede e e-mail.
+    """
+    dados: dict[int, dict[str, str]] = {}
+    if not html:
+        return dados
+
+    if BS4_OK and BeautifulSoup is not None:
+        soup = BeautifulSoup(html, "html.parser")
+        for table in soup.find_all("table"):
+            trs = table.find_all("tr")
+            if not trs:
+                continue
+            header_cells = [c.get_text(" ", strip=True) for c in trs[0].find_all(["th", "td"])]
+            idx_zona = _indice_coluna(header_cells, ["ZONA"])
+            idx_sede = _indice_coluna(header_cells, ["MUNIC", "SEDE"]) or _indice_coluna(header_cells, ["MUNICÍPIO", "SEDE"])
+            idx_email = _indice_coluna(header_cells, ["E-MAIL"]) or _indice_coluna(header_cells, ["EMAIL"])
+
+            for tr in trs[1:]:
+                cells = [_limpar_texto(c.get_text(" ", strip=True)) for c in tr.find_all(["th", "td"])]
+                if len(cells) < 2:
+                    continue
+                zona_txt = cells[idx_zona] if idx_zona is not None and idx_zona < len(cells) else cells[0]
+                n = _extrair_numero_zona(zona_txt)
+                if not n:
+                    continue
+                sede = ""
+                if idx_sede is not None and idx_sede < len(cells):
+                    sede = cells[idx_sede]
+                elif len(cells) > 1:
+                    sede = cells[1]
+                email = ""
+                if idx_email is not None and idx_email < len(cells):
+                    email = cells[idx_email]
+                for cell in cells:
+                    if "@" in cell and "tre-ba" in cell.lower():
+                        email = cell
+                        break
+                if sede and sede.upper() not in {"MUNICÍPIO SEDE", "MUNICIPIO SEDE", "SEDE"}:
+                    dados[n] = {"municipio_sede": sede, "email": normalizar_email(email) or email_padrao_zona(n)}
+
+    # Fallback por linhas de texto: funciona se a página vier sem <table>, mas com texto estruturado.
+    texto = re.sub(r"<[^>]+>", " ", html)
+    texto = re.sub(r"\s+", " ", texto)
+    padrao = re.compile(
+        r"\b(\d{1,3})\s*(?:ª|a|º|o)?\s*(?:Zona|ZE)?\b\s*[-–—]?\s*([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-Za-zÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç' .-]{2,60})",
+        re.IGNORECASE,
+    )
+    for n_txt, sede in padrao.findall(texto):
+        n = int(n_txt)
+        if 1 <= n <= 205 and n not in dados:
+            sede = _limpar_texto(sede)
+            # Evita capturar palavras genéricas como cabeçalhos.
+            if sede.upper() not in {"ZONA", "MUNICÍPIO", "MUNICIPIO", "ENDEREÇO", "ENDERECO", "E MAIL"}:
+                dados[n] = {"municipio_sede": sede, "email": email_padrao_zona(n)}
+    return dados
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def consultar_zonas_tre_ba_online() -> dict[int, dict[str, str]]:
+    """Consulta a fonte pública do TRE-BA para preencher município-sede.
+
+    Se a rede do Streamlit Cloud, do TRE-BA ou o layout da página impedir a leitura,
+    retorna dicionário vazio e o sistema preserva o que já estiver no banco.
+    """
+    acumulado: dict[int, dict[str, str]] = {}
+    for url in TRE_BA_ZONAS_URLS:
+        try:
+            html = _baixar_html(url)
+            dados = extrair_zonas_tre_ba_html(html)
+            for numero, info in dados.items():
+                if numero not in acumulado or info.get("municipio_sede"):
+                    acumulado[numero] = info
+        except Exception:
+            continue
+    return acumulado
+
+
+def aplicar_zonas_padrao(conn, usar_tabela_local: bool = True, sobrescrever_municipio: bool = False) -> tuple[int, int]:
+    """Garante 001-205, e-mail padrão e município-sede vindo da tabela local.
+
+    Não consulta internet no carregamento do sistema. A Corregedoria pode editar
+    a sede manualmente ou importar uma tabela CSV/XLSX na tela Zonas Eleitorais.
+    Retorna (zonas_garantidas, municipios_aplicados_da_tabela_local).
+    """
+    municipios_aplicados = 0
+    for numero, nome, sede_base, email_base in ZONAS_PADRAO:
+        sede_tabela = _limpar_texto(MUNICIPIOS_SEDE_FIXOS.get(int(numero), "")) if usar_tabela_local else ""
+        sede = sede_tabela or _limpar_texto(sede_base)
+        email = normalizar_email(email_base or email_padrao_zona(numero))
+        conn.execute(text("""
+            insert into simoc_zonas (numero, nome, municipio_sede, email)
+            values (:numero, :nome, :sede, :email)
+            on conflict (numero) do update set
+                nome = excluded.nome,
+                email = excluded.email,
+                municipio_sede = case
+                    when :sobrescrever = true then excluded.municipio_sede
+                    when simoc_zonas.municipio_sede is null
+                      or trim(simoc_zonas.municipio_sede) = ''
+                      or simoc_zonas.municipio_sede in ('Município-sede não informado', 'Município-sede pendente de atualização', 'Município-sede pendente de cadastro', 'Sede não informada')
+                    then excluded.municipio_sede
+                    else simoc_zonas.municipio_sede
+                end
+        """), {"numero": numero, "nome": nome, "sede": sede, "email": email, "sobrescrever": sobrescrever_municipio})
+        if sede_tabela:
+            municipios_aplicados += 1
+    return len(ZONAS_PADRAO), municipios_aplicados
+
+
+def importar_tabela_zonas_csv(conn, df: pd.DataFrame, sobrescrever: bool = False) -> int:
+    """Importa CSV/XLSX com colunas: numero, municipio_sede e opcionalmente email."""
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    col_num = cols.get("numero") or cols.get("zona") or cols.get("número")
+    col_sede = cols.get("municipio_sede") or cols.get("município_sede") or cols.get("municipio") or cols.get("município") or cols.get("sede")
+    col_email = cols.get("email") or cols.get("e-mail")
+    if not col_num or not col_sede:
+        raise ValueError("A tabela precisa ter as colunas numero e municipio_sede.")
+    atualizados = 0
+    for _, r in df.iterrows():
+        try:
+            numero = int(str(r[col_num]).strip().replace("ª", "").split()[0])
+        except Exception:
+            continue
+        if numero < 1 or numero > 205:
+            continue
+        sede = _limpar_texto(r[col_sede])
+        if not sede:
+            continue
+        email = normalizar_email(r[col_email]) if col_email else email_padrao_zona(numero)
+        if not email:
+            email = email_padrao_zona(numero)
+        conn.execute(text("""
+            insert into simoc_zonas (numero, nome, municipio_sede, email)
+            values (:numero, :nome, :sede, :email)
+            on conflict (numero) do update set
+                nome = excluded.nome,
+                email = excluded.email,
+                municipio_sede = case
+                    when :sobrescrever = true then excluded.municipio_sede
+                    when simoc_zonas.municipio_sede is null
+                      or trim(simoc_zonas.municipio_sede) = ''
+                      or simoc_zonas.municipio_sede in ('Município-sede não informado', 'Município-sede pendente de atualização', 'Município-sede pendente de cadastro', 'Sede não informada')
+                    then excluded.municipio_sede
+                    else simoc_zonas.municipio_sede
+                end
+        """), {"numero": numero, "nome": f"{numero:03d}ª Zona Eleitoral", "sede": sede, "email": email, "sobrescrever": sobrescrever})
+        atualizados += 1
+    return atualizados
+
+
+def modelo_csv_zonas() -> bytes:
+    df = pd.DataFrame([
+        {"numero": i, "zona": f"{i:03d}ª Zona Eleitoral", "municipio_sede": MUNICIPIOS_SEDE_FIXOS.get(i, ""), "email": email_padrao_zona(i)}
+        for i in range(1, 206)
+    ])
+    return df.to_csv(index=False, sep=";").encode("utf-8-sig")
+
+def contar_zonas_sem_municipio(conn) -> int:
+    return conn.execute(text("""
+        select count(*)
+        from simoc_zonas
+        where municipio_sede is null
+           or trim(municipio_sede) = ''
+           or municipio_sede in ('Município-sede não informado', 'Município-sede pendente de atualização', 'Sede não informada')
+    """)).scalar() or 0
+
+
+def registrar_municipios_sede_no_sistema(conn) -> tuple[int, int]:
+    """Registra e-mail padrão e município-sede pela tabela local fixa.
+
+    Esta função não consulta a internet; mantém compatibilidade com versões
+    anteriores e aplica apenas a tabela local/editável.
+    """
+    return aplicar_zonas_padrao(conn, usar_tabela_local=True, sobrescrever_municipio=False)
+
+
 # ============================================================
 # BANCO / SCHEMA
 # ============================================================
@@ -276,6 +734,12 @@ def bootstrap_schema_once() -> bool:
         );
         """))
         conn.execute(text("""
+        create table if not exists simoc_config (
+            chave text primary key,
+            valor text,
+            atualizado_em timestamptz default now()
+        );
+        
         create table if not exists simoc_auditoria (
             id serial primary key,
             usuario_id integer,
@@ -300,13 +764,9 @@ def bootstrap_schema_once() -> bool:
         ]
         for sql in alteracoes:
             conn.execute(text(sql))
-        # Zonas base
-        for numero, nome, sede in ZONAS_PADRAO:
-            conn.execute(text("""
-                insert into simoc_zonas (numero, nome, municipio_sede)
-                values (:numero, :nome, :sede)
-                on conflict (numero) do nothing
-            """), {"numero": numero, "nome": nome, "sede": sede})
+        # Zonas base: garante 001-205 e e-mail institucional padronizado.
+        # Não consulta internet no carregamento; município-sede vem da tabela local/editável.
+        registrar_municipios_sede_no_sistema(conn)
         # Admin inicial
         admin_email = normalizar_email(get_secret("ADMIN_EMAIL", ""))
         admin_password = get_secret("ADMIN_PASSWORD", "")
@@ -888,15 +1348,81 @@ def pagina_mensagens_corregedoria():
 
 
 def pagina_zonas():
-    st.subheader("Zonas Eleitorais e município-sede")
-    st.caption("Para fins de controle, cada Zona é vinculada ao município-sede. Quando houver mais de um município abrangido, considere apenas a sede.")
+    st.subheader("Zonas Eleitorais, município-sede e e-mail institucional")
+    st.caption("O e-mail segue o padrão zona001@tre-ba.jus.br. O município-sede fica registrado no banco local do SIMOC para evitar consulta à internet a cada abertura do sistema.")
+
+    col_a, col_b, col_c = st.columns([1, 1, 1])
+    with col_a:
+        if st.button("Garantir e-mails padrão zona001 a zona205", use_container_width=True):
+            with get_engine().begin() as conn:
+                aplicar_zonas_padrao(conn, usar_tabela_local=False, sobrescrever_municipio=False)
+            registrar_auditoria("garantir_emails_zonas", "simoc_zonas")
+            st.success("E-mails padronizados atualizados: zona001@tre-ba.jus.br até zona205@tre-ba.jus.br.")
+            st.rerun()
+    with col_b:
+        if st.button("Aplicar tabela local de municípios-sede", use_container_width=True):
+            with get_engine().begin() as conn:
+                total, aplicados = aplicar_zonas_padrao(conn, usar_tabela_local=True, sobrescrever_municipio=False)
+            registrar_auditoria("aplicar_tabela_local_municipios", "simoc_zonas", detalhe=f"{aplicados} sedes aplicadas")
+            if aplicados:
+                st.success(f"Tabela local aplicada. {aplicados} município(s)-sede preenchido(s); {total} e-mails garantidos.")
+            else:
+                st.info("A tabela local ainda não tem municípios-sede preenchidos no código. Use a edição manual ou importe uma planilha CSV.")
+            st.rerun()
+    with col_c:
+        st.download_button(
+            "Baixar modelo CSV das Zonas",
+            data=modelo_csv_zonas(),
+            file_name="modelo_zonas_municipio_sede.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    st.markdown("### Importar tabela de município-sede")
+    st.caption("Use uma planilha com colunas: numero, municipio_sede e, opcionalmente, email. O sistema grava no Supabase e não precisa consultar a internet depois.")
+    arq = st.file_uploader("Importar CSV/XLSX de Zonas", type=["csv", "xlsx"], key="upload_zonas_sede")
+    sobrescrever = st.checkbox("Sobrescrever municípios-sede já preenchidos", value=False)
+    if arq is not None and st.button("Importar tabela para o sistema", use_container_width=True):
+        try:
+            if arq.name.lower().endswith(".xlsx"):
+                df_imp = pd.read_excel(arq)
+            else:
+                df_imp = pd.read_csv(arq, sep=None, engine="python")
+            with get_engine().begin() as conn:
+                qtd = importar_tabela_zonas_csv(conn, df_imp, sobrescrever=sobrescrever)
+            registrar_auditoria("importar_tabela_zonas", "simoc_zonas", detalhe=f"{qtd} linhas importadas")
+            st.success(f"Tabela importada. {qtd} Zona(s) atualizada(s).")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Não consegui importar a tabela: {e}")
+
+    pendentes = scalar("""
+        select count(*) from simoc_zonas
+        where municipio_sede is null
+           or trim(municipio_sede) = ''
+           or municipio_sede in ('Município-sede não informado', 'Município-sede pendente de atualização', 'Município-sede pendente de cadastro', 'Sede não informada')
+    """) or 0
+    if pendentes:
+        st.warning(f"Ainda há {pendentes} Zona(s) sem município-sede registrado. Preencha pela tabela editável abaixo ou importe o CSV oficial/conferido.")
+
     df = dataframe("select id, numero, nome, municipio_sede, email, ativa from simoc_zonas order by numero")
+    if not df.empty:
+        df["email_padrao"] = df["numero"].apply(lambda n: email_padrao_zona(int(n)))
     st.dataframe(df, use_container_width=True, hide_index=True)
-    with st.expander("Atualizar município-sede/e-mail de uma Zona"):
+
+    st.markdown("### Editar município-sede diretamente no sistema")
+    st.caption("Edite uma Zona por vez. Essas informações ficam salvas no Supabase.")
+    with st.expander("Ajustar manualmente uma Zona"):
         with st.form("form_zona"):
             zlabel = st.selectbox("Zona", zona_options())
-            sede = st.text_input("Município-sede")
-            email = st.text_input("E-mail da Zona")
+            atual = None
+            zid_atual = zona_id_from_label(zlabel) if zlabel else None
+            if zid_atual:
+                atual_linhas = rows("select numero, municipio_sede, email from simoc_zonas where id=:id", {"id": zid_atual})
+                atual = atual_linhas[0] if atual_linhas else None
+            sede = st.text_input("Município-sede", value=(atual.get("municipio_sede") if atual else "") or "")
+            numero_sel = int(atual.get("numero") if atual else ((zlabel.split("|")[1].strip()[:3] if "|" in zlabel else "0") or 0))
+            email = st.text_input("E-mail da Zona", value=(atual.get("email") if atual else "") or (email_padrao_zona(numero_sel) if numero_sel else ""))
             ok = st.form_submit_button("Salvar dados da Zona")
         if ok:
             zid = zona_id_from_label(zlabel)
