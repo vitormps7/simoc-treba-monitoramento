@@ -999,8 +999,14 @@ def processar_links_publicos():
 
 def tela_login():
     header()
+    try:
+        bootstrap_schema_once()
+    except Exception as e:
+        st.error(f"Não foi possível preparar o banco de dados: {e}")
+        return
     processar_links_publicos()
-    abas = st.tabs(["Entrar", "Cadastrar usuário", "Recuperar senha"])
+    abas = st.tabs(["Entrar", "Cadastrar acesso da Zona", "Recuperar senha"])
+
     with abas[0]:
         st.subheader("Acesso ao sistema")
         with st.form("login_form"):
@@ -1008,7 +1014,6 @@ def tela_login():
             senha = st.text_input("Senha", type="password")
             entrar = st.form_submit_button("Entrar", type="primary")
         if entrar:
-            bootstrap_schema_once()
             row = rows("""
                 select u.*, z.numero as zona_numero, z.municipio_sede
                 from simoc_usuarios u
@@ -1023,54 +1028,51 @@ def tela_login():
                 registrar_auditoria("login", "simoc_usuarios", u["id"], email)
                 st.rerun()
             elif row and not row[0].get("validado"):
-                st.warning("Cadastro ainda não validado pela Corregedoria ou pelo link de validação.")
+                st.warning("Cadastro recebido, mas ainda pendente de validação pela Corregedoria/Admin.")
             else:
                 st.error("Usuário ou senha inválidos.")
 
     with abas[1]:
-        st.subheader("Cadastrar usuário")
-        st.caption("Usuários das Zonas devem escolher a Zona correspondente. A Corregedoria poderá validar o cadastro.")
-        with st.form("cadastro_form"):
-            nome = st.text_input("Nome completo")
-            email = normalizar_email(st.text_input("E-mail institucional"))
-            perfil = st.selectbox("Perfil", ["chefe_cartorio", "substituto", "corregedoria_analista"])
-            zlabel = st.selectbox("Zona vinculada", zona_options() if get_secret("DATABASE_URL") else ["Configure o banco primeiro"], disabled=(perfil not in PERFIS_ZONA))
+        st.subheader("Cadastrar acesso da Zona Eleitoral")
+        st.caption("Cada Zona faz seu próprio cadastro. O acesso fica pendente até validação pela Corregedoria/Admin.")
+        with st.form("cadastro_zona_form"):
+            nome = st.text_input("Nome completo do servidor responsável pelo acesso")
+            perfil = st.selectbox("Perfil na Zona", ["chefe_cartorio", "substituto"])
+            zlabel = st.selectbox("Zona Eleitoral", zona_options())
+            zid = zona_id_from_label(zlabel)
+            zinfo = rows("select numero, municipio_sede, email from simoc_zonas where id=:id", {"id": zid}) if zid else []
+            email_sugerido = normalizar_email(zinfo[0].get("email") if zinfo else "") or (email_padrao_zona(int(zinfo[0]["numero"])) if zinfo else "")
+            st.info(f"E-mail institucional esperado para esta Zona: {email_sugerido or 'selecione a Zona'}")
+            email = normalizar_email(st.text_input("E-mail institucional da Zona", value=email_sugerido))
             senha = st.text_input("Senha", type="password")
             conf = st.text_input("Confirmar senha", type="password")
-            cadastrar = st.form_submit_button("Cadastrar")
+            cadastrar = st.form_submit_button("Enviar cadastro para validação", type="primary")
         if cadastrar:
-            bootstrap_schema_once()
             if not nome.strip():
-                st.warning("Informe o nome.")
+                st.warning("Informe o nome do responsável pelo acesso.")
+            elif not zid:
+                st.warning("Selecione a Zona Eleitoral.")
             elif not email_institucional(email):
                 st.warning(f"Use e-mail institucional {DOMINIO_INSTITUCIONAL}.")
+            elif email != email_sugerido:
+                st.warning(f"Para cadastro de Zona, use o e-mail padrão {email_sugerido}.")
             elif senha != conf or len(senha or "") < 6:
                 st.warning("As senhas não conferem ou têm menos de 6 caracteres.")
-            elif perfil in PERFIS_ZONA and not zona_id_from_label(zlabel):
-                st.warning("Selecione a Zona vinculada.")
             elif scalar("select id from simoc_usuarios where email=:email", {"email": email}):
-                st.warning("Este e-mail já está cadastrado.")
+                st.warning("Este e-mail já está cadastrado. Use Recuperar senha ou aguarde validação, se ainda estiver pendente.")
             else:
-                token = secrets.token_urlsafe(32)
-                zid = zona_id_from_label(zlabel) if perfil in PERFIS_ZONA else None
                 rid = scalar("""
                     insert into simoc_usuarios (nome, email, senha_hash, perfil, zona_id, ativo, validado, token_validacao)
-                    values (:nome, :email, :senha, :perfil, :zona_id, true, false, :token)
+                    values (:nome, :email, :senha, :perfil, :zona_id, true, false, null)
                     returning id
-                """, {"nome": nome.strip(), "email": email, "senha": hash_password(senha), "perfil": perfil, "zona_id": zid, "token": token})
-                link = link_validacao(token)
-                ok, msg = enviar_email(email, f"Validação de cadastro - {NOME_SISTEMA}", f"Olá, {nome}.\n\nValide seu cadastro no SIMOC-BA:\n{link}")
-                registrar_auditoria("cadastro_usuario", "simoc_usuarios", rid, email)
-                if ok:
-                    st.success("Cadastro realizado. Link de validação enviado ao e-mail.")
-                else:
-                    st.warning(f"Cadastro realizado. {msg} Link de validação: {link}")
+                """, {"nome": nome.strip(), "email": email, "senha": hash_password(senha), "perfil": perfil, "zona_id": zid})
+                registrar_auditoria("cadastro_zona_pendente", "simoc_usuarios", rid, email)
+                st.success("Cadastro enviado. Aguarde validação pela Corregedoria/Admin para acessar o módulo da Zona.")
 
     with abas[2]:
         st.subheader("Recuperar senha")
         email = normalizar_email(st.text_input("E-mail cadastrado", key="email_rec"))
         if st.button("Gerar link de recuperação"):
-            bootstrap_schema_once()
             row = rows("select id, nome, email from simoc_usuarios where email=:email and ativo=true", {"email": email})
             if not row:
                 st.error("E-mail não encontrado.")
@@ -1587,27 +1589,144 @@ def pagina_zonas():
 
 
 def pagina_usuarios():
-    st.subheader("Usuários")
-    df = dataframe("""
-        select u.id, u.nome, u.email, u.perfil, z.numero as zona, z.municipio_sede, u.ativo, u.validado, u.ultimo_login, u.criado_em
-        from simoc_usuarios u left join simoc_zonas z on z.id=u.zona_id
-        order by u.criado_em desc
-    """)
-    if not df.empty:
-        df["ultimo_login"] = df["ultimo_login"].apply(fmt_data)
-        df["criado_em"] = df["criado_em"].apply(fmt_data)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    pendentes = rows("select id, nome, email from simoc_usuarios where validado=false and ativo=true order by criado_em")
-    if pendentes:
-        st.markdown("### Cadastros pendentes")
+    st.subheader("Usuários e validação de acessos")
+    st.caption("As Zonas fazem o próprio cadastro na tela de acesso. A Corregedoria/Admin valida, rejeita, ativa/desativa ou cria usuários internos quando necessário.")
+
+    pend_count = scalar("select count(*) from simoc_usuarios where validado=false and ativo=true") or 0
+    total = scalar("select count(*) from simoc_usuarios") or 0
+    ativos = scalar("select count(*) from simoc_usuarios where ativo=true") or 0
+    colm1, colm2, colm3 = st.columns(3)
+    with colm1: metric_card("Pendentes de validação", pend_count)
+    with colm2: metric_card("Usuários ativos", ativos)
+    with colm3: metric_card("Total cadastrado", total)
+
+    abas = st.tabs(["Validação de cadastros", "Cadastrar usuário pela Corregedoria", "Gestão de usuários"])
+
+    with abas[0]:
+        st.markdown("### Cadastros aguardando validação")
+        pendentes = rows("""
+            select u.id, u.nome, u.email, u.perfil, u.criado_em, z.numero, z.municipio_sede
+            from simoc_usuarios u
+            left join simoc_zonas z on z.id=u.zona_id
+            where u.validado=false and u.ativo=true
+            order by u.criado_em
+        """)
+        if not pendentes:
+            st.info("Não há cadastro pendente no momento.")
         for u in pendentes:
-            c1, c2 = st.columns([3,1])
-            with c1: st.write(f"{u['nome']} - {u['email']}")
-            with c2:
-                if st.button("Validar usuário", key=f"valid_user_{u['id']}"):
-                    execute("update simoc_usuarios set validado=true, token_validacao=null, atualizado_em=now() where id=:id", {"id": u["id"]})
-                    registrar_auditoria("validar_usuario_admin", "simoc_usuarios", u["id"], u["email"])
-                    st.success("Usuário validado.")
+            with st.container(border=True):
+                st.markdown(f"**{u['nome']}**")
+                st.write(f"E-mail: `{u['email']}`")
+                st.write(f"Perfil: `{u['perfil']}`")
+                st.write(f"Zona: {int(u['numero']):03d}ª ZE - {u.get('municipio_sede') or 'Sede não informada'}" if u.get('numero') else "Zona: não vinculada")
+                st.caption(f"Solicitado em {fmt_data(u.get('criado_em'))}")
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("Validar acesso", key=f"validar_user_{u['id']}", type="primary"):
+                        execute("update simoc_usuarios set validado=true, token_validacao=null, atualizado_em=now() where id=:id", {"id": u["id"]})
+                        registrar_auditoria("validar_usuario_admin", "simoc_usuarios", u["id"], u["email"])
+                        st.success("Usuário validado.")
+                        st.rerun()
+                with c2:
+                    if st.button("Rejeitar/desativar", key=f"rejeitar_user_{u['id']}"):
+                        execute("update simoc_usuarios set ativo=false, atualizado_em=now() where id=:id", {"id": u["id"]})
+                        registrar_auditoria("rejeitar_usuario_admin", "simoc_usuarios", u["id"], u["email"])
+                        st.warning("Cadastro desativado.")
+                        st.rerun()
+
+    with abas[1]:
+        st.markdown("### Cadastrar usuário pela Corregedoria/Admin")
+        st.caption("Use esta opção para criar acessos internos da Corregedoria ou criar acesso de Zona diretamente, se necessário.")
+        with st.form("form_admin_criar_usuario"):
+            nome = st.text_input("Nome completo")
+            perfil = st.selectbox("Perfil", ["corregedoria_gestor", "corregedoria_analista", "chefe_cartorio", "substituto", "admin"], key="perfil_admin_criar")
+            zlabel = st.selectbox("Zona vinculada", zona_options(), disabled=(perfil not in PERFIS_ZONA), key="zona_admin_criar")
+            zid = zona_id_from_label(zlabel) if perfil in PERFIS_ZONA else None
+            email_padrao = ""
+            if zid:
+                zinfo = rows("select numero, email from simoc_zonas where id=:id", {"id": zid})
+                if zinfo:
+                    email_padrao = normalizar_email(zinfo[0].get("email")) or email_padrao_zona(int(zinfo[0]["numero"]))
+            email = normalizar_email(st.text_input("E-mail", value=email_padrao))
+            senha = st.text_input("Senha inicial", type="password")
+            ativo = st.checkbox("Ativo", value=True)
+            validado = st.checkbox("Já validado", value=True)
+            criar = st.form_submit_button("Criar usuário", type="primary")
+        if criar:
+            if not nome.strip():
+                st.warning("Informe o nome.")
+            elif not email_institucional(email):
+                st.warning(f"Use e-mail institucional {DOMINIO_INSTITUCIONAL}.")
+            elif perfil in PERFIS_ZONA and not zid:
+                st.warning("Selecione a Zona vinculada.")
+            elif perfil in PERFIS_ZONA and email_padrao and email != email_padrao:
+                st.warning(f"Para usuário da Zona, use o e-mail padrão {email_padrao}.")
+            elif len(senha or "") < 6:
+                st.warning("A senha deve ter pelo menos 6 caracteres.")
+            elif scalar("select id from simoc_usuarios where email=:email", {"email": email}):
+                st.warning("Este e-mail já está cadastrado.")
+            else:
+                rid = scalar("""
+                    insert into simoc_usuarios (nome, email, senha_hash, perfil, zona_id, ativo, validado)
+                    values (:nome, :email, :senha, :perfil, :zona_id, :ativo, :validado)
+                    returning id
+                """, {"nome": nome.strip(), "email": email, "senha": hash_password(senha), "perfil": perfil, "zona_id": zid, "ativo": ativo, "validado": validado})
+                registrar_auditoria("criar_usuario_admin", "simoc_usuarios", rid, email)
+                st.success("Usuário criado.")
+                st.rerun()
+
+    with abas[2]:
+        st.markdown("### Gestão de usuários")
+        df = dataframe("""
+            select u.id, u.nome, u.email, u.perfil, z.numero as zona, z.municipio_sede, u.ativo, u.validado, u.ultimo_login, u.criado_em
+            from simoc_usuarios u left join simoc_zonas z on z.id=u.zona_id
+            order by u.criado_em desc
+        """)
+        if not df.empty:
+            df["ultimo_login"] = df["ultimo_login"].apply(fmt_data)
+            df["criado_em"] = df["criado_em"].apply(fmt_data)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        with st.expander("Editar um usuário existente"):
+            usuarios = rows("""
+                select u.id, u.nome, u.email, u.perfil, u.ativo, u.validado, z.numero, z.municipio_sede
+                from simoc_usuarios u left join simoc_zonas z on z.id=u.zona_id
+                order by u.nome
+            """)
+            if not usuarios:
+                st.info("Nenhum usuário cadastrado.")
+            else:
+                opts = [f"{u['id']} | {u['nome']} - {u['email']}" for u in usuarios]
+                opt = st.selectbox("Usuário", opts, key="usuario_editar_select")
+                uid = int(opt.split("|", 1)[0].strip())
+                u = next(x for x in usuarios if x["id"] == uid)
+                with st.form("form_editar_usuario"):
+                    nome = st.text_input("Nome", value=u.get("nome") or "")
+                    perfil = st.selectbox("Perfil", ["admin", "corregedoria_gestor", "corregedoria_analista", "chefe_cartorio", "substituto"], index=["admin", "corregedoria_gestor", "corregedoria_analista", "chefe_cartorio", "substituto"].index(u.get("perfil") or "chefe_cartorio"))
+                    email = normalizar_email(st.text_input("E-mail", value=u.get("email") or ""))
+                    zlabel = st.selectbox("Zona vinculada", zona_options(), disabled=(perfil not in PERFIS_ZONA), key="zona_editar_usuario")
+                    ativo = st.checkbox("Ativo", value=bool(u.get("ativo")))
+                    validado = st.checkbox("Validado", value=bool(u.get("validado")))
+                    nova_senha = st.text_input("Nova senha (deixe em branco para manter)", type="password")
+                    salvar = st.form_submit_button("Salvar alterações", type="primary")
+                if salvar:
+                    zid = zona_id_from_label(zlabel) if perfil in PERFIS_ZONA else None
+                    params = {"id": uid, "nome": nome.strip(), "email": email, "perfil": perfil, "zona_id": zid, "ativo": ativo, "validado": validado}
+                    senha_sql = ""
+                    if nova_senha:
+                        if len(nova_senha) < 6:
+                            st.warning("A nova senha deve ter pelo menos 6 caracteres.")
+                            st.stop()
+                        senha_sql = ", senha_hash=:senha"
+                        params["senha"] = hash_password(nova_senha)
+                    execute(f"""
+                        update simoc_usuarios
+                        set nome=:nome, email=:email, perfil=:perfil, zona_id=:zona_id, ativo=:ativo, validado=:validado,
+                            atualizado_em=now(){senha_sql}
+                        where id=:id
+                    """, params)
+                    registrar_auditoria("editar_usuario_admin", "simoc_usuarios", uid, email)
+                    st.success("Usuário atualizado.")
                     st.rerun()
 
 
