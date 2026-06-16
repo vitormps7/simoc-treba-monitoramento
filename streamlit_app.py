@@ -1,1071 +1,1171 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
-from io import BytesIO
 import base64
 import hashlib
+import hmac
 import json
 import os
 import secrets
 import smtplib
+from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
+from io import BytesIO
+from typing import Any, Iterable
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
-from db import db_session, run_schema
-from security import hash_password, verify_password
-from logo_corregedoria import LOGO_CORREGEDORIA_BASE64
-from treba_importer import importar_zonas, seed_zonas_bahia_padrao, TREBA_CONSULTA_CARTORIOS_URL
-
-st.set_page_config(page_title="SIMOC-BA", page_icon="🛡️", layout="wide", initial_sidebar_state="collapsed")
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    REPORTLAB_OK = True
+except Exception:
+    REPORTLAB_OK = False
 
 # ============================================================
-# CONFIGURAÇÕES GERAIS
+# CONFIGURACAO GERAL
 # ============================================================
+
+st.set_page_config(page_title="SIMOC-BA", page_icon="🛡️", layout="wide")
 
 FUSO_HORARIO_BRASILIA = timezone(timedelta(hours=-3), name="BRT")
-FORMATO_DATA = "%d/%m/%Y"
-FORMATO_DATA_HORA = "%d/%m/%Y %H:%M"
-NOME_SISTEMA = "SIMOC-BA"
-NOME_COMPLETO = "Sistema de Monitoramento Cartorário das Zonas Eleitorais da Bahia"
 DOMINIO_INSTITUCIONAL = "@tre-ba.jus.br"
-UNIDADE_CORREGEDORIA = "CRE-BA"
-APP_BASE_URL_DEFAULT = ""
+NOME_SISTEMA = "SIMOC-BA"
+NOME_COMPLETO = "Sistema de Monitoramento Cartorário das Zonas Eleitorais"
+UNIDADE_CORREGEDORIA = "Corregedoria Regional Eleitoral da Bahia"
 
-PERFIS = [
-    ("admin", "Administrador do sistema"),
-    ("corregedoria_gestor", "Corregedoria - gestor"),
-    ("corregedoria_analista", "Corregedoria - analista"),
-    ("chefe_cartorio", "Zona Eleitoral - chefe de cartório"),
-    ("substituto", "Zona Eleitoral - substituto"),
-    ("auditor", "Auditoria/consulta"),
-]
-PERFIS_CORREGEDORIA = ["admin", "corregedoria_gestor", "corregedoria_analista"]
-PERFIS_ZONA = ["chefe_cartorio", "substituto"]
+PERFIS_CORREGEDORIA = {"admin", "corregedoria_gestor", "corregedoria_analista"}
+PERFIS_ZONA = {"chefe_cartorio", "substituto"}
 PERIODICIDADES = ["diariamente", "semanalmente", "quinzenalmente", "mensalmente", "bimestralmente", "trimestralmente", "anualmente", "por demanda"]
 GRUPOS_PADRAO = ["ELO", "SISTEMAS DA INTRANET", "OBSERVAÇÕES", "OUTROS"]
-STATUS_TAREFA = ["pendente", "atrasado", "em_analise", "validado", "devolvido", "cumprido", "cumprido_com_ressalva", "nao_se_aplica"]
-STATUS_CHECKLIST_ZONA = ["cumprido", "cumprido_com_ressalva", "nao_se_aplica", "pendente"]
-TABELAS_BACKUP = [
-    "perfis", "zonas_eleitorais", "municipios_zona", "usuarios", "itens_monitoramento",
-    "ciclos_monitoramento", "tarefas_zona", "respostas", "validacoes_corregedoria",
-    "comentarios_tarefa", "anexos_tarefa", "logs_auditoria", "configuracoes_sistema"
-]
+STATUS_CHECKLIST = ["pendente", "em_analise", "validado", "devolvido", "nao_realizado"]
+
+# Lista base: garante 001 a 205. Municipio-sede pode ser atualizado depois pela Corregedoria.
+ZONAS_PADRAO = [(i, f"{i:03d}ª Zona Eleitoral", "Município-sede não informado") for i in range(1, 206)]
 
 # ============================================================
-# ESTILO VISUAL: SEM MENU LATERAL
+# ESTILO
 # ============================================================
 
 st.markdown(
     """
     <style>
-    [data-testid="stSidebar"], [data-testid="collapsedControl"] {display:none !important; visibility:hidden !important; width:0 !important; min-width:0 !important;}
-    .block-container {padding-top:1.1rem; max-width:1450px;}
-    .main-header {background:linear-gradient(120deg,#0F2F52,#174A7C 55%,#EAF3FF);padding:18px 22px;border-radius:18px;color:white;margin-bottom:12px;border:1px solid #D7E0EA;display:flex;align-items:center;gap:18px;box-shadow:0 8px 22px rgba(15,47,82,.14);}
-    .main-header img {background:white;border-radius:14px;padding:8px;max-width:180px;max-height:70px;object-fit:contain;}
-    .main-header h1 {font-size:24px;margin:0;color:white;line-height:1.25;}
-    .main-header p {font-size:13px;margin:4px 0;color:#EAF3FF;}
-    .auth-hero {background:#DCE7F3;border:1px solid #C6D2E1;border-radius:18px;padding:28px 24px 26px 24px;margin-bottom:18px;box-shadow:0 4px 16px rgba(15,47,82,.06);}
-    .auth-logo-band {background:linear-gradient(90deg,#EEF4FB 0%, #F8FAFD 100%);border-radius:18px;padding:18px 26px;display:flex;align-items:center;justify-content:center;min-height:150px;margin:0 auto 20px auto;max-width:820px;}
-    .auth-logo-band img {max-width:100%;width:min(760px, 92%);max-height:140px;object-fit:contain;display:block;}
-    .auth-title {text-align:center;font-size:25px;line-height:1.28;font-weight:900;color:#174A7C;margin:6px 0 8px 0;}
-    .auth-subtitle {text-align:center;font-size:14px;color:#415466;margin:0 auto;max-width:980px;}
-    .banner {border-radius:18px;padding:18px 22px;margin:12px 0 18px 0;border:1px solid #D7E0EA;box-shadow:0 8px 20px rgba(15,47,82,.06);}
-    .banner.corregedoria {background:linear-gradient(120deg,#0F2F52,#174A7C);color:white;}
-    .banner.zona {background:linear-gradient(120deg,#EAF3FF,#FFFFFF);color:#174A7C;border-left:7px solid #174A7C;}
-    .banner h2 {margin:0 0 8px 0;font-size:25px;font-weight:900;}
-    .banner p {margin:4px 0;font-size:14px;line-height:1.45;}
-    .card {background:white;border:1px solid #D7E0EA;border-radius:16px;padding:16px;box-shadow:0 6px 16px rgba(15,47,82,.06);min-height:120px;}
-    .card h3 {font-size:18px;color:#174A7C;margin:0 0 8px 0;font-weight:900;}
-    .card p {font-size:13px;color:#475569;margin:0 0 8px 0;line-height:1.42;}
-    .step-flow {display:flex;gap:10px;flex-wrap:wrap;margin:8px 0 16px 0;}
-    .step-flow span {background:#EAF3FF;border:1px solid #BFDBFE;color:#174A7C;border-radius:999px;padding:8px 12px;font-weight:800;font-size:13px;}
-    .metric-card {background:white;border:1px solid #D7E0EA;border-left:5px solid #174A7C;border-radius:14px;padding:13px 14px;min-height:95px;box-shadow:0 4px 12px rgba(15,47,82,.07);}
-    .metric-card .label {font-size:12px;font-weight:800;color:#4B5563;text-transform:uppercase;}
-    .metric-card .value {font-size:28px;font-weight:900;color:#174A7C;}
-    div[data-testid="stButton"] button {border-radius:10px;font-weight:800;border:1px solid #174A7C;}
-    div[data-testid="stButton"] button[kind="primary"] {background:#174A7C;border-color:#174A7C;color:white;}
-    div[role="radiogroup"] {gap:.35rem;}
-    div[role="radiogroup"] label {background:#F8FAFC;border:1px solid #CBD5E1;border-radius:999px;padding:6px 10px;margin-right:4px;font-weight:800;}
-    div[data-testid="stDataFrame"] {border:1px solid #D7E0EA;border-radius:12px;overflow:hidden;}
-    .small-note {font-size:12px;color:#64748B;}
-    .danger-box {border-left:6px solid #B91C1C;background:#FEF2F2;border-radius:12px;padding:12px;margin:10px 0;color:#7F1D1D;}
-    .ok-box {border-left:6px solid #15803D;background:#F0FDF4;border-radius:12px;padding:12px;margin:10px 0;color:#14532D;}
+    section[data-testid="stSidebar"] {display: none !important;}
+    div[data-testid="collapsedControl"] {display: none !important;}
+    .block-container {padding-top: 1.2rem; max-width: 1480px;}
+    .main-header {background: linear-gradient(90deg, #123E66 0%, #5FA6D9 100%); padding: 26px 30px; border-radius: 18px; color: #fff; margin-bottom: 22px; box-shadow: 0 12px 28px rgba(18,62,102,.16);} 
+    .main-header h1 {font-size: 34px; margin:0 0 8px 0; font-weight: 900; letter-spacing: .5px;}
+    .main-header p {margin: 3px 0; font-weight: 700;}
+    .user-strip {background:#EEF6FF; border:1px solid #C8DAEF; color:#123E66; padding: 10px 14px; border-radius: 12px; margin-bottom: 16px; font-weight: 800;}
+    .nav-box {background:#F7FAFE; border:1px solid #D8E3F0; padding:12px; border-radius:16px; margin-bottom:18px;}
+    .module-card {background:#FFFFFF; border:1px solid #CAD9EA; border-radius:14px; padding:22px 22px; min-height:142px; box-shadow:0 7px 16px rgba(15,47,82,.05);} 
+    .module-card h3 {margin:0 0 12px 0; color:#063B68; font-size:20px; font-weight:900;}
+    .module-card p {margin:0; color:#23384F; font-size:14px; line-height:1.45;}
+    .flow-box {background:#0F3F67; color:white; border-radius:16px; padding:18px 22px; margin:12px 0 20px 0;}
+    .flow-box b {color:white;}
+    .metric-card {background:#fff; border:1px solid #D7E0EA; border-radius:14px; padding:16px; box-shadow:0 4px 12px rgba(15,47,82,.05);} 
+    .metric-card .label {font-size:12px; color:#65758A; text-transform:uppercase; font-weight:900;}
+    .metric-card .value {font-size:28px; color:#123E66; font-weight:900; margin-top:3px;}
+    .alert-danger {background:#FEF2F2; color:#991B1B; border:1px solid #FCA5A5; padding:12px 14px; border-radius:12px; margin:10px 0; font-weight:800;}
+    .alert-warn {background:#FFFBEB; color:#92400E; border:1px solid #FCD34D; padding:12px 14px; border-radius:12px; margin:10px 0; font-weight:800;}
+    .alert-ok {background:#F0FDF4; color:#166534; border:1px solid #86EFAC; padding:12px 14px; border-radius:12px; margin:10px 0; font-weight:800;}
+    div.stButton > button {width:100%; border-radius:10px; border:1px solid #0F4C81; color:#0F3F67; background:white; font-weight:800; min-height:42px;}
+    div.stButton > button:hover {border-color:#0F4C81; background:#EAF3FF; color:#0F3F67;}
+    div[data-testid="stForm"] {border:1px solid #D7E0EA; border-radius:14px; padding:18px; background:#FFFFFF;}
+    .small-muted {color:#65758A; font-size:13px;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # ============================================================
-# FUNÇÕES UTILITÁRIAS
+# UTILITARIOS
 # ============================================================
 
 def agora_brasilia() -> datetime:
-    return datetime.now(timezone.utc).astimezone(FUSO_HORARIO_BRASILIA).replace(microsecond=0)
+    return datetime.now(FUSO_HORARIO_BRASILIA)
 
 
 def hoje_brasilia() -> date:
     return agora_brasilia().date()
 
 
-def fmt_data(valor) -> str:
-    if valor is None:
+def fmt_data(v: Any) -> str:
+    if v is None or v == "":
         return ""
-    try:
-        if pd.isna(valor):
-            return ""
-    except Exception:
-        pass
-    if isinstance(valor, datetime):
-        return valor.strftime(FORMATO_DATA_HORA)
-    if isinstance(valor, date):
-        return valor.strftime(FORMATO_DATA)
-    try:
-        s = str(valor)
-        return pd.to_datetime(valor).strftime(FORMATO_DATA_HORA if ":" in s or "T" in s else FORMATO_DATA)
-    except Exception:
-        return str(valor)
+    if isinstance(v, str):
+        try:
+            v = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except Exception:
+            return v
+    if isinstance(v, datetime):
+        return v.astimezone(FUSO_HORARIO_BRASILIA).strftime("%d/%m/%Y %H:%M")
+    if isinstance(v, date):
+        return v.strftime("%d/%m/%Y")
+    return str(v)
 
 
-def normalizar_email(email: str) -> str:
+def normalizar_email(email: str | None) -> str:
     return (email or "").strip().lower()
 
 
 def email_institucional(email: str) -> bool:
-    return normalizar_email(email).endswith(DOMINIO_INSTITUCIONAL)
+    email = normalizar_email(email)
+    return email.endswith(DOMINIO_INSTITUCIONAL) or email == normalizar_email(get_secret("ADMIN_EMAIL", ""))
 
 
-def get_query_param(nome: str) -> str | None:
+def get_secret(nome: str, padrao: str = "") -> str:
     try:
-        valor = st.query_params.get(nome)
-        if isinstance(valor, list):
-            return valor[0] if valor else None
-        return valor
+        return str(st.secrets.get(nome, os.getenv(nome, padrao)))
     except Exception:
-        return None
+        return os.getenv(nome, padrao)
 
 
-def base_url() -> str:
+def app_base_url() -> str:
+    return get_secret("APP_BASE_URL", "").rstrip("/")
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", (password or "").encode("utf-8"), salt.encode("ascii"), 220000)
+    return f"pbkdf2_sha256${salt}${base64.b64encode(dk).decode('ascii')}"
+
+
+def verify_password(password: str, stored: str | None) -> bool:
+    if not stored:
+        return False
     try:
-        return st.secrets.get("APP_BASE_URL") or os.getenv("APP_BASE_URL", APP_BASE_URL_DEFAULT)
+        if stored.startswith("pbkdf2_sha256$"):
+            _, salt, digest = stored.split("$", 2)
+            dk = hashlib.pbkdf2_hmac("sha256", (password or "").encode("utf-8"), salt.encode("ascii"), 220000)
+            return hmac.compare_digest(base64.b64encode(dk).decode("ascii"), digest)
+        # compatibilidade com hashes antigos do passlib, quando disponivel
+        try:
+            from passlib.context import CryptContext
+            ctx = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+            return bool(ctx.verify(password or "", stored))
+        except Exception:
+            return False
     except Exception:
-        return os.getenv("APP_BASE_URL", APP_BASE_URL_DEFAULT)
+        return False
 
 
-def gerar_link_validacao(token: str) -> str:
-    base = base_url().rstrip("/")
-    return f"{base}/?validar={token}" if base else f"?validar={token}"
+@st.cache_resource(show_spinner=False)
+def get_engine() -> Engine:
+    url = get_secret("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL não configurada nos Secrets do Streamlit.")
+    return create_engine(url, pool_pre_ping=True, pool_size=2, max_overflow=1, pool_recycle=180, connect_args={"connect_timeout": 8})
 
 
-def gerar_link_recuperacao(token: str) -> str:
-    base = base_url().rstrip("/")
-    return f"{base}/?recuperar={token}" if base else f"?recuperar={token}"
+def execute(sql: str, params: dict | None = None):
+    engine = get_engine()
+    with engine.begin() as conn:
+        return conn.execute(text(sql), params or {})
 
 
-def enviar_email(destinatario: str, assunto: str, corpo: str):
+def rows(sql: str, params: dict | None = None) -> list[dict]:
+    engine = get_engine()
+    with engine.begin() as conn:
+        return [dict(r) for r in conn.execute(text(sql), params or {}).mappings().all()]
+
+
+def scalar(sql: str, params: dict | None = None) -> Any:
+    engine = get_engine()
+    with engine.begin() as conn:
+        return conn.execute(text(sql), params or {}).scalar()
+
+
+def dataframe(sql: str, params: dict | None = None) -> pd.DataFrame:
+    return pd.DataFrame(rows(sql, params))
+
+
+# ============================================================
+# BANCO / SCHEMA
+# ============================================================
+
+@st.cache_resource(show_spinner=False)
+def bootstrap_schema_once() -> bool:
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("""
+        create table if not exists simoc_zonas (
+            id serial primary key,
+            numero integer unique not null,
+            nome text not null,
+            municipio_sede text,
+            email text,
+            ativa boolean default true,
+            criado_em timestamptz default now()
+        );
+        """))
+        conn.execute(text("""
+        create table if not exists simoc_usuarios (
+            id serial primary key,
+            nome text not null,
+            email text unique not null,
+            senha_hash text not null,
+            perfil text not null,
+            zona_id integer references simoc_zonas(id),
+            ativo boolean default true,
+            validado boolean default false,
+            token_validacao text,
+            token_recuperacao text,
+            token_recuperacao_expira_em timestamptz,
+            ultimo_login timestamptz,
+            criado_em timestamptz default now(),
+            atualizado_em timestamptz default now()
+        );
+        """))
+        conn.execute(text("""
+        create table if not exists simoc_atividades (
+            id serial primary key,
+            grupo text not null default 'OUTROS',
+            descricao text not null,
+            periodicidade text not null,
+            responsavel_referencia text,
+            prazo_dias integer default 5,
+            orientacao text,
+            exige_evidencia boolean default false,
+            ativa boolean default true,
+            criado_por integer references simoc_usuarios(id),
+            criado_em timestamptz default now(),
+            atualizado_em timestamptz default now()
+        );
+        """))
+        conn.execute(text("""
+        create table if not exists simoc_checklists (
+            id serial primary key,
+            atividade_id integer not null references simoc_atividades(id),
+            zona_id integer not null references simoc_zonas(id),
+            periodo_inicio date not null,
+            periodo_fim date not null,
+            prazo_preenchimento date not null,
+            status text not null default 'pendente',
+            responsavel_zona text,
+            realizado boolean default false,
+            data_execucao date,
+            observacao_zona text,
+            evidencia_url text,
+            enviado_em timestamptz,
+            validado_em timestamptz,
+            validado_por integer references simoc_usuarios(id),
+            comentario_corregedoria text,
+            criado_em timestamptz default now(),
+            atualizado_em timestamptz default now(),
+            unique (atividade_id, zona_id, periodo_inicio, periodo_fim)
+        );
+        """))
+        conn.execute(text("""
+        create table if not exists simoc_mensagens (
+            id serial primary key,
+            zona_id integer references simoc_zonas(id),
+            titulo text not null,
+            mensagem text not null,
+            tipo text default 'manual',
+            checklist_id integer references simoc_checklists(id),
+            criada_por integer references simoc_usuarios(id),
+            criada_em timestamptz default now(),
+            lida_em timestamptz
+        );
+        """))
+        conn.execute(text("""
+        create table if not exists simoc_auditoria (
+            id serial primary key,
+            usuario_id integer,
+            acao text not null,
+            entidade text,
+            entidade_id text,
+            detalhe text,
+            criado_em timestamptz default now()
+        );
+        """))
+        # Garante colunas caso alguma tabela ja exista incompleta
+        alteracoes = [
+            "alter table simoc_checklists add column if not exists responsavel_zona text",
+            "alter table simoc_checklists add column if not exists realizado boolean default false",
+            "alter table simoc_checklists add column if not exists observacao_zona text",
+            "alter table simoc_checklists add column if not exists evidencia_url text",
+            "alter table simoc_checklists add column if not exists comentario_corregedoria text",
+            "alter table simoc_atividades add column if not exists prazo_dias integer default 5",
+            "alter table simoc_atividades add column if not exists responsavel_referencia text",
+            "alter table simoc_atividades add column if not exists orientacao text",
+            "alter table simoc_atividades add column if not exists exige_evidencia boolean default false",
+        ]
+        for sql in alteracoes:
+            conn.execute(text(sql))
+        # Zonas base
+        for numero, nome, sede in ZONAS_PADRAO:
+            conn.execute(text("""
+                insert into simoc_zonas (numero, nome, municipio_sede)
+                values (:numero, :nome, :sede)
+                on conflict (numero) do nothing
+            """), {"numero": numero, "nome": nome, "sede": sede})
+        # Admin inicial
+        admin_email = normalizar_email(get_secret("ADMIN_EMAIL", ""))
+        admin_password = get_secret("ADMIN_PASSWORD", "")
+        if admin_email and admin_password:
+            existe = conn.execute(text("select id from simoc_usuarios where email=:email"), {"email": admin_email}).scalar()
+            if not existe:
+                conn.execute(text("""
+                    insert into simoc_usuarios (nome, email, senha_hash, perfil, ativo, validado)
+                    values ('Administrador', :email, :senha, 'admin', true, true)
+                """), {"email": admin_email, "senha": hash_password(admin_password)})
+    return True
+
+
+def registrar_auditoria(acao: str, entidade: str = "", entidade_id: Any = None, detalhe: str = ""):
     try:
-        smtp_host = st.secrets.get("SMTP_HOST", os.getenv("SMTP_HOST", ""))
-        smtp_port = int(st.secrets.get("SMTP_PORT", os.getenv("SMTP_PORT", 587)))
-        smtp_user = st.secrets.get("SMTP_USER", os.getenv("SMTP_USER", ""))
-        smtp_password = st.secrets.get("SMTP_PASSWORD", os.getenv("SMTP_PASSWORD", ""))
-        remetente = st.secrets.get("EMAIL_REMETENTE", os.getenv("EMAIL_REMETENTE", smtp_user))
+        u = st.session_state.get("user") or {}
+        execute("""
+            insert into simoc_auditoria (usuario_id, acao, entidade, entidade_id, detalhe)
+            values (:uid, :acao, :entidade, :entidade_id, :detalhe)
+        """, {"uid": u.get("id"), "acao": acao, "entidade": entidade, "entidade_id": str(entidade_id or ""), "detalhe": detalhe})
     except Exception:
-        smtp_host = os.getenv("SMTP_HOST", "")
-        smtp_port = int(os.getenv("SMTP_PORT", 587))
-        smtp_user = os.getenv("SMTP_USER", "")
-        smtp_password = os.getenv("SMTP_PASSWORD", "")
-        remetente = os.getenv("EMAIL_REMETENTE", smtp_user)
+        pass
 
-    if not smtp_host or not smtp_user or not smtp_password or not remetente:
-        return False, "E-mail SMTP não configurado."
 
+# ============================================================
+# EMAIL / LINKS
+# ============================================================
+
+def enviar_email(destino: str, assunto: str, corpo: str) -> tuple[bool, str]:
+    host = get_secret("SMTP_HOST")
+    user = get_secret("SMTP_USER")
+    password = get_secret("SMTP_PASSWORD")
+    remetente = get_secret("EMAIL_REMETENTE", user)
+    porta = int(get_secret("SMTP_PORT", "587") or "587")
+    if not host or not user or not password or not remetente:
+        return False, "SMTP não configurado."
     try:
         msg = EmailMessage()
-        msg["From"] = remetente
-        msg["To"] = destinatario
         msg["Subject"] = assunto
+        msg["From"] = remetente
+        msg["To"] = destino
         msg.set_content(corpo)
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as smtp:
+        with smtplib.SMTP(host, porta, timeout=20) as smtp:
             smtp.starttls()
-            smtp.login(smtp_user, smtp_password)
+            smtp.login(user, password)
             smtp.send_message(msg)
         return True, "E-mail enviado."
     except Exception as e:
         return False, f"Falha ao enviar e-mail: {e}"
 
 
-def dataframe(sql: str, **params) -> pd.DataFrame:
-    with db_session() as conn:
-        df = pd.read_sql_query(text(sql), conn, params=params)
-    for col in df.columns:
-        if any(x in col.lower() for x in ["data", "prazo", "periodo", "criado", "atualizado", "enviado", "validado", "login"]):
-            try:
-                df[col] = df[col].apply(fmt_data)
-            except Exception:
-                pass
-    return df
+def link_validacao(token: str) -> str:
+    base = app_base_url()
+    return f"{base}?validar={token}" if base else f"?validar={token}"
 
 
-def executar(sql: str, **params):
-    with db_session() as conn:
-        return conn.execute(text(sql), params)
+def link_recuperacao(token: str) -> str:
+    base = app_base_url()
+    return f"{base}?recuperar={token}" if base else f"?recuperar={token}"
 
-
-@st.cache_resource(show_spinner=False)
-def preparar_banco_once() -> bool:
-    run_schema()
-    with db_session() as conn:
-        for nome, descricao in PERFIS:
-            conn.execute(text("insert into perfis (nome, descricao) values (:n,:d) on conflict (nome) do update set descricao=excluded.descricao"), {"n": nome, "d": descricao})
-        admin_email = st.secrets.get("ADMIN_EMAIL", os.getenv("ADMIN_EMAIL", "vitormps7@gmail.com"))
-        admin_password = st.secrets.get("ADMIN_PASSWORD", os.getenv("ADMIN_PASSWORD", "Admin2026"))
-        perfil_admin = conn.execute(text("select id from perfis where nome='admin'")).scalar_one()
-        existe = conn.execute(text("select id from usuarios where email=:email"), {"email": admin_email}).scalar()
-        if not existe:
-            conn.execute(text("""
-                insert into usuarios (nome, email, senha_hash, perfil_id, ativo, validado, secao_operador)
-                values ('Administrador', :email, :senha, :perfil, true, true, :secao)
-            """), {"email": admin_email, "senha": hash_password(admin_password), "perfil": perfil_admin, "secao": UNIDADE_CORREGEDORIA})
-    return True
-
-
-def garantir_banco() -> bool:
-    try:
-        preparar_banco_once()
-        return True
-    except Exception as e:
-        st.error(f"Não foi possível conectar ao banco: {e}")
-        return False
-
-
-def usuario_logado() -> dict:
-    return st.session_state.get("user", {})
-
-
-def perfil_atual() -> str:
-    return usuario_logado().get("perfil", "")
-
-
-def eh_corregedoria() -> bool:
-    return perfil_atual() in PERFIS_CORREGEDORIA
-
-
-def eh_zona() -> bool:
-    return perfil_atual() in PERFIS_ZONA
-
-
-def registrar_auditoria(acao: str, entidade: str, entidade_id=None, detalhe: str | None = None):
-    try:
-        u = usuario_logado()
-        with db_session() as conn:
-            conn.execute(text("""
-                insert into logs_auditoria (usuario_id, usuario_nome, usuario_email, acao, entidade, entidade_id, detalhe, criado_em)
-                values (:uid, :nome, :email, :acao, :entidade, :eid, :detalhe, (now() at time zone 'America/Sao_Paulo'))
-            """), {"uid": u.get("id"), "nome": u.get("nome"), "email": u.get("email"), "acao": acao, "entidade": entidade, "eid": entidade_id, "detalhe": detalhe})
-    except Exception:
-        pass
-
-
-def zonas_options(incluir_todas=False):
-    if not garantir_banco():
-        return []
-    df = dataframe("select id, lpad(numero::text,3,'0') || 'ª ZE - ' || coalesce(municipio_sede,'A definir') || '/BA' as label from zonas_eleitorais order by numero")
-    opts = []
-    if incluir_todas:
-        opts.append((None, "Todas as Zonas"))
-    opts.extend([(int(r["id"]), r["label"]) for _, r in df.iterrows()])
-    return opts
 
 # ============================================================
-# ACESSO, CADASTRO E RECUPERAÇÃO DE SENHA
-# ============================================================
-
-def processar_validacao() -> bool:
-    token = get_query_param("validar")
-    if not token:
-        return False
-    if not garantir_banco():
-        return True
-    with db_session() as conn:
-        row = conn.execute(text("select id, email from usuarios where token_validacao=:t"), {"t": token}).mappings().first()
-        if not row:
-            st.error("Link de validação inválido ou já utilizado.")
-            return True
-        conn.execute(text("update usuarios set validado=true, token_validacao=null, atualizado_em=(now() at time zone 'America/Sao_Paulo') where id=:id"), {"id": row["id"]})
-    st.success("Cadastro validado com sucesso. Faça login para acessar o sistema.")
-    registrar_auditoria("validacao_cadastro", "usuarios", row["id"], row["email"])
-    return True
-
-
-def processar_recuperacao() -> bool:
-    token = get_query_param("recuperar")
-    if not token:
-        return False
-    if not garantir_banco():
-        return True
-    with db_session() as conn:
-        row = conn.execute(text("""
-            select id, email from usuarios
-            where token_recuperacao=:t and token_recuperacao_expira_em >= (now() at time zone 'America/Sao_Paulo')
-        """), {"t": token}).mappings().first()
-    if not row:
-        st.error("Link de recuperação inválido ou expirado.")
-        return True
-    st.markdown(f"### Redefinir senha de {row['email']}")
-    with st.form("nova_senha"):
-        nova = st.text_input("Nova senha", type="password")
-        confirma = st.text_input("Confirmar nova senha", type="password")
-        salvar = st.form_submit_button("Salvar nova senha", type="primary")
-    if salvar:
-        if len(nova or "") < 6:
-            st.warning("A senha deve ter pelo menos 6 caracteres.")
-        elif nova != confirma:
-            st.warning("As senhas não conferem.")
-        else:
-            with db_session() as conn:
-                conn.execute(text("""
-                    update usuarios set senha_hash=:h, token_recuperacao=null, token_recuperacao_expira_em=null,
-                    atualizado_em=(now() at time zone 'America/Sao_Paulo') where id=:id
-                """), {"h": hash_password(nova), "id": row["id"]})
-            st.success("Senha redefinida com sucesso. Faça login novamente.")
-            registrar_auditoria("recuperacao_senha", "usuarios", row["id"], row["email"])
-    return True
-
-
-def login_box():
-    st.markdown(f"""
-    <div class="auth-hero">
-        <div class="auth-logo-band"><img src="data:image/png;base64,{LOGO_CORREGEDORIA_BASE64}"></div>
-        <div class="auth-title">SIMOC-BA - Sistema de Monitoramento Cartorário</div>
-        <div class="auth-subtitle">Corregedoria cadastra atividades e periodicidade; Zona executa, informa responsável e marca o checklist.</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    if processar_validacao() or processar_recuperacao():
-        return
-
-    aba_login, aba_cadastro, aba_recuperar = st.tabs(["Entrar", "Cadastrar usuário", "Recuperar senha"])
-
-    with aba_login:
-        st.subheader("Acesso ao sistema")
-        with st.form("login"):
-            email = normalizar_email(st.text_input("E-mail"))
-            senha = st.text_input("Senha", type="password")
-            submitted = st.form_submit_button("Entrar", type="primary")
-        if submitted:
-            if not garantir_banco():
-                return
-            with db_session() as conn:
-                row = conn.execute(text("""
-                    select u.id, u.nome, u.email, u.senha_hash, u.zona_eleitoral_id, p.nome as perfil, u.validado, u.ativo
-                    from usuarios u join perfis p on p.id = u.perfil_id
-                    where u.email=:email
-                """), {"email": email}).mappings().first()
-                if not row or not row["ativo"] or not verify_password(senha, row["senha_hash"]):
-                    st.error("Usuário ou senha inválidos.")
-                elif not row["validado"]:
-                    st.warning("Cadastro ainda não validado. Use o link enviado ao e-mail ou solicite validação à Corregedoria.")
-                else:
-                    conn.execute(text("update usuarios set ultimo_login=(now() at time zone 'America/Sao_Paulo') where id=:id"), {"id": row["id"]})
-                    st.session_state.user = {k: v for k, v in dict(row).items() if k != "senha_hash"}
-                    registrar_auditoria("login", "usuarios", row["id"], email)
-                    st.rerun()
-
-    with aba_cadastro:
-        st.subheader("Cadastrar usuário")
-        st.caption("Cadastro preferencialmente com e-mail institucional. Usuários de Zona devem estar vinculados à Zona Eleitoral correspondente.")
-        if not garantir_banco():
-            return
-        zopts = zonas_options()
-        with st.form("cadastro_usuario"):
-            nome = st.text_input("Nome completo")
-            email = normalizar_email(st.text_input("E-mail institucional"))
-            perfil = st.selectbox("Tipo de acesso", ["chefe_cartorio", "substituto", "corregedoria_analista"], format_func=lambda x: {"chefe_cartorio":"Chefe de Cartório/Zona", "substituto":"Substituto da Zona", "corregedoria_analista":"Analista da Corregedoria"}.get(x,x))
-            zona_id = None
-            if perfil in PERFIS_ZONA:
-                label = st.selectbox("Zona vinculada", [lbl for _, lbl in zopts] if zopts else [])
-                for zid, lbl in zopts:
-                    if lbl == label:
-                        zona_id = zid
-            senha = st.text_input("Senha", type="password")
-            confirmar = st.text_input("Confirmar senha", type="password")
-            submitted = st.form_submit_button("Cadastrar")
-        if submitted:
-            if not nome.strip():
-                st.warning("Informe o nome.")
-            elif not email:
-                st.warning("Informe o e-mail.")
-            elif not email_institucional(email):
-                st.warning(f"O e-mail deve terminar com {DOMINIO_INSTITUCIONAL}.")
-            elif perfil in PERFIS_ZONA and not zona_id:
-                st.warning("Selecione a Zona vinculada.")
-            elif len(senha or "") < 6:
-                st.warning("A senha deve ter pelo menos 6 caracteres.")
-            elif senha != confirmar:
-                st.warning("As senhas não conferem.")
-            else:
-                token = secrets.token_urlsafe(32)
-                with db_session() as conn:
-                    perfil_id = conn.execute(text("select id from perfis where nome=:p"), {"p": perfil}).scalar_one()
-                    existe = conn.execute(text("select id from usuarios where email=:e"), {"e": email}).scalar()
-                    if existe:
-                        st.warning("Este e-mail já está cadastrado.")
-                    else:
-                        uid = conn.execute(text("""
-                            insert into usuarios (nome,email,senha_hash,perfil_id,zona_eleitoral_id,ativo,validado,token_validacao,secao_operador)
-                            values (:n,:e,:s,:p,:z,true,false,:t,:secao) returning id
-                        """), {"n": nome.strip(), "e": email, "s": hash_password(senha), "p": perfil_id, "z": zona_id, "t": token, "secao": UNIDADE_CORREGEDORIA}).scalar_one()
-                        link = gerar_link_validacao(token)
-                        ok, msg = enviar_email(
-                            email,
-                            f"Validação de cadastro - {NOME_SISTEMA}",
-                            f"Olá, {nome}.\n\nPara validar seu acesso ao {NOME_SISTEMA}, acesse:\n\n{link}\n\nCaso não tenha solicitado, ignore esta mensagem."
-                        )
-                        registrar_auditoria("cadastro_usuario", "usuarios", uid, email)
-                        if ok:
-                            st.success("Cadastro realizado. Link de validação enviado ao e-mail informado.")
-                        else:
-                            st.warning(f"{msg} Link de validação gerado: {link}")
-
-    with aba_recuperar:
-        st.subheader("Recuperar senha")
-        st.caption("Use esta opção apenas para usuário já cadastrado.")
-        email_rec = normalizar_email(st.text_input("E-mail cadastrado", key="email_recuperacao"))
-        if st.button("Gerar link de recuperação"):
-            if not garantir_banco():
-                return
-            with db_session() as conn:
-                row = conn.execute(text("select id, nome, email from usuarios where email=:e and ativo=true"), {"e": email_rec}).mappings().first()
-                if not row:
-                    st.error("E-mail não encontrado.")
-                else:
-                    token = secrets.token_urlsafe(32)
-                    expira = agora_brasilia() + timedelta(hours=2)
-                    conn.execute(text("""
-                        update usuarios set token_recuperacao=:t, token_recuperacao_expira_em=:expira,
-                        atualizado_em=(now() at time zone 'America/Sao_Paulo') where id=:id
-                    """), {"t": token, "expira": expira.replace(tzinfo=None), "id": row["id"]})
-                    link = gerar_link_recuperacao(token)
-                    ok, msg = enviar_email(
-                        row["email"],
-                        f"Recuperação de senha - {NOME_SISTEMA}",
-                        f"Recebemos uma solicitação de recuperação de senha para o {NOME_SISTEMA}.\n\nAcesse o link abaixo para criar uma nova senha:\n\n{link}\n\nO link expira em 2 horas. Caso você não tenha solicitado, ignore esta mensagem."
-                    )
-                    registrar_auditoria("gerar_recuperacao_senha", "usuarios", row["id"], row["email"])
-                    if ok:
-                        st.success("Link de recuperação enviado ao e-mail cadastrado.")
-                    else:
-                        st.warning(f"{msg} Link de recuperação de senha gerado: {link}")
-
-# ============================================================
-# LAYOUT
+# COMPONENTES VISUAIS
 # ============================================================
 
 def header():
-    u = usuario_logado()
     st.markdown(f"""
-    <div class="main-header">
-        <img src="data:image/png;base64,{LOGO_CORREGEDORIA_BASE64}">
-        <div>
-            <h1>SIMOC-BA - Monitoramento Cartorário</h1>
-            <p>{NOME_COMPLETO} | Data e horário de Brasília</p>
-            <p>Usuário: <b>{u.get('nome','')}</b> · Perfil: <b>{u.get('perfil','')}</b></p>
-        </div>
+    <div class='main-header'>
+        <h1>🛡️ {NOME_SISTEMA}</h1>
+        <p>{NOME_COMPLETO}</p>
+        <p>{UNIDADE_CORREGEDORIA} · Fiscalização, prazos, checklist e comunicação com as Zonas Eleitorais</p>
     </div>
     """, unsafe_allow_html=True)
-    col1, col2 = st.columns([5, 1])
-    with col2:
-        if st.button("Sair", use_container_width=True):
-            registrar_auditoria("logout", "usuarios", u.get("id"))
-            st.session_state.clear()
+
+
+def usuario_logado() -> dict | None:
+    return st.session_state.get("user")
+
+
+def eh_corregedoria() -> bool:
+    u = usuario_logado() or {}
+    return u.get("perfil") in PERFIS_CORREGEDORIA
+
+
+def eh_zona() -> bool:
+    u = usuario_logado() or {}
+    return u.get("perfil") in PERFIS_ZONA
+
+
+def user_strip():
+    u = usuario_logado() or {}
+    zona = ""
+    if u.get("zona_numero"):
+        zona = f" · Zona {int(u['zona_numero']):03d} - {u.get('municipio_sede') or ''}"
+    st.markdown(f"<div class='user-strip'>Usuário: {u.get('nome')} · Perfil: {u.get('perfil')}{zona}</div>", unsafe_allow_html=True)
+
+
+def nav(paginas: list[str], key: str) -> str:
+    if key not in st.session_state:
+        st.session_state[key] = paginas[0]
+    st.markdown("<div class='nav-box'>", unsafe_allow_html=True)
+    pagina = st.radio("Navegação", paginas, horizontal=True, key=key, label_visibility="collapsed")
+    st.markdown("</div>", unsafe_allow_html=True)
+    return pagina
+
+
+def card(titulo: str, texto: str):
+    st.markdown(f"<div class='module-card'><h3>{titulo}</h3><p>{texto}</p></div>", unsafe_allow_html=True)
+
+
+def metric_card(label: str, value: Any):
+    st.markdown(f"<div class='metric-card'><div class='label'>{label}</div><div class='value'>{value}</div></div>", unsafe_allow_html=True)
+
+
+def alert(tipo: str, msg: str):
+    cls = {"ok": "alert-ok", "warn": "alert-warn", "danger": "alert-danger"}.get(tipo, "alert-warn")
+    st.markdown(f"<div class='{cls}'>{msg}</div>", unsafe_allow_html=True)
+
+
+def zona_options(incluir_todas=False) -> list[str]:
+    zs = rows("select id, numero, municipio_sede from simoc_zonas where ativa=true order by numero")
+    opts = [f"{z['id']} | {int(z['numero']):03d}ª ZE - {z.get('municipio_sede') or 'Sede não informada'}" for z in zs]
+    return (["Todas as Zonas"] if incluir_todas else []) + opts
+
+
+def zona_id_from_label(label: str | None) -> int | None:
+    if not label or label == "Todas as Zonas":
+        return None
+    try:
+        return int(str(label).split("|", 1)[0].strip())
+    except Exception:
+        return None
+
+
+# ============================================================
+# AUTENTICACAO
+# ============================================================
+
+def processar_links_publicos():
+    params = st.query_params
+    if "validar" in params:
+        bootstrap_schema_once()
+        token = params.get("validar")
+        row = rows("select id, email from simoc_usuarios where token_validacao=:t", {"t": token})
+        if row:
+            execute("update simoc_usuarios set validado=true, token_validacao=null, atualizado_em=now() where id=:id", {"id": row[0]["id"]})
+            st.success("Cadastro validado. Você já pode entrar no sistema.")
+            registrar_auditoria("validacao_usuario", "simoc_usuarios", row[0]["id"], row[0]["email"])
+        else:
+            st.warning("Link de validação inválido ou já utilizado.")
+        st.query_params.clear()
+
+    if "recuperar" in params:
+        bootstrap_schema_once()
+        token = params.get("recuperar")
+        row = rows("""
+            select id, email from simoc_usuarios
+            where token_recuperacao=:t and token_recuperacao_expira_em >= now()
+        """, {"t": token})
+        if not row:
+            st.error("Link de recuperação inválido ou expirado.")
+            return True
+        st.subheader("Redefinir senha")
+        with st.form("form_redefinir"):
+            nova = st.text_input("Nova senha", type="password")
+            conf = st.text_input("Confirmar nova senha", type="password")
+            ok = st.form_submit_button("Salvar nova senha")
+        if ok:
+            if len(nova or "") < 6:
+                st.warning("A senha deve ter pelo menos 6 caracteres.")
+            elif nova != conf:
+                st.warning("As senhas não conferem.")
+            else:
+                execute("""
+                    update simoc_usuarios
+                    set senha_hash=:h, token_recuperacao=null, token_recuperacao_expira_em=null, atualizado_em=now()
+                    where id=:id
+                """, {"h": hash_password(nova), "id": row[0]["id"]})
+                registrar_auditoria("recuperacao_senha", "simoc_usuarios", row[0]["id"], row[0]["email"])
+                st.success("Senha redefinida. Faça login novamente.")
+                st.query_params.clear()
+        return True
+    return False
+
+
+def tela_login():
+    header()
+    processar_links_publicos()
+    abas = st.tabs(["Entrar", "Cadastrar usuário", "Recuperar senha"])
+    with abas[0]:
+        st.subheader("Acesso ao sistema")
+        with st.form("login_form"):
+            email = normalizar_email(st.text_input("E-mail"))
+            senha = st.text_input("Senha", type="password")
+            entrar = st.form_submit_button("Entrar", type="primary")
+        if entrar:
+            bootstrap_schema_once()
+            row = rows("""
+                select u.*, z.numero as zona_numero, z.municipio_sede
+                from simoc_usuarios u
+                left join simoc_zonas z on z.id=u.zona_id
+                where u.email=:email and u.ativo=true
+            """, {"email": email})
+            if row and row[0].get("validado") and verify_password(senha, row[0].get("senha_hash")):
+                execute("update simoc_usuarios set ultimo_login=now() where id=:id", {"id": row[0]["id"]})
+                u = row[0]
+                u.pop("senha_hash", None)
+                st.session_state.user = u
+                registrar_auditoria("login", "simoc_usuarios", u["id"], email)
+                st.rerun()
+            elif row and not row[0].get("validado"):
+                st.warning("Cadastro ainda não validado pela Corregedoria ou pelo link de validação.")
+            else:
+                st.error("Usuário ou senha inválidos.")
+
+    with abas[1]:
+        st.subheader("Cadastrar usuário")
+        st.caption("Usuários das Zonas devem escolher a Zona correspondente. A Corregedoria poderá validar o cadastro.")
+        with st.form("cadastro_form"):
+            nome = st.text_input("Nome completo")
+            email = normalizar_email(st.text_input("E-mail institucional"))
+            perfil = st.selectbox("Perfil", ["chefe_cartorio", "substituto", "corregedoria_analista"])
+            zlabel = st.selectbox("Zona vinculada", zona_options() if get_secret("DATABASE_URL") else ["Configure o banco primeiro"], disabled=(perfil not in PERFIS_ZONA))
+            senha = st.text_input("Senha", type="password")
+            conf = st.text_input("Confirmar senha", type="password")
+            cadastrar = st.form_submit_button("Cadastrar")
+        if cadastrar:
+            bootstrap_schema_once()
+            if not nome.strip():
+                st.warning("Informe o nome.")
+            elif not email_institucional(email):
+                st.warning(f"Use e-mail institucional {DOMINIO_INSTITUCIONAL}.")
+            elif senha != conf or len(senha or "") < 6:
+                st.warning("As senhas não conferem ou têm menos de 6 caracteres.")
+            elif perfil in PERFIS_ZONA and not zona_id_from_label(zlabel):
+                st.warning("Selecione a Zona vinculada.")
+            elif scalar("select id from simoc_usuarios where email=:email", {"email": email}):
+                st.warning("Este e-mail já está cadastrado.")
+            else:
+                token = secrets.token_urlsafe(32)
+                zid = zona_id_from_label(zlabel) if perfil in PERFIS_ZONA else None
+                rid = scalar("""
+                    insert into simoc_usuarios (nome, email, senha_hash, perfil, zona_id, ativo, validado, token_validacao)
+                    values (:nome, :email, :senha, :perfil, :zona_id, true, false, :token)
+                    returning id
+                """, {"nome": nome.strip(), "email": email, "senha": hash_password(senha), "perfil": perfil, "zona_id": zid, "token": token})
+                link = link_validacao(token)
+                ok, msg = enviar_email(email, f"Validação de cadastro - {NOME_SISTEMA}", f"Olá, {nome}.\n\nValide seu cadastro no SIMOC-BA:\n{link}")
+                registrar_auditoria("cadastro_usuario", "simoc_usuarios", rid, email)
+                if ok:
+                    st.success("Cadastro realizado. Link de validação enviado ao e-mail.")
+                else:
+                    st.warning(f"Cadastro realizado. {msg} Link de validação: {link}")
+
+    with abas[2]:
+        st.subheader("Recuperar senha")
+        email = normalizar_email(st.text_input("E-mail cadastrado", key="email_rec"))
+        if st.button("Gerar link de recuperação"):
+            bootstrap_schema_once()
+            row = rows("select id, nome, email from simoc_usuarios where email=:email and ativo=true", {"email": email})
+            if not row:
+                st.error("E-mail não encontrado.")
+            else:
+                token = secrets.token_urlsafe(32)
+                expira = agora_brasilia() + timedelta(hours=2)
+                execute("""
+                    update simoc_usuarios set token_recuperacao=:t, token_recuperacao_expira_em=:e, atualizado_em=now()
+                    where id=:id
+                """, {"t": token, "e": expira, "id": row[0]["id"]})
+                link = link_recuperacao(token)
+                ok, msg = enviar_email(email, f"Recuperação de senha - {NOME_SISTEMA}", f"Olá.\n\nUse o link para redefinir sua senha:\n{link}\n\nO link expira em 2 horas.")
+                registrar_auditoria("gerar_recuperacao_senha", "simoc_usuarios", row[0]["id"], email)
+                if ok:
+                    st.success("Link enviado ao e-mail cadastrado.")
+                else:
+                    st.warning(f"{msg} Link de recuperação: {link}")
+
+
+# ============================================================
+# REGRAS DE NEGOCIO
+# ============================================================
+
+def gerar_checklists(atividade_id: int, zona_id: int | None, inicio: date, fim: date, prazo: date) -> int:
+    if zona_id:
+        zonas = rows("select id from simoc_zonas where id=:id and ativa=true", {"id": zona_id})
+    else:
+        zonas = rows("select id from simoc_zonas where ativa=true order by numero")
+    count = 0
+    for z in zonas:
+        execute("""
+            insert into simoc_checklists (atividade_id, zona_id, periodo_inicio, periodo_fim, prazo_preenchimento, status)
+            values (:atividade, :zona, :inicio, :fim, :prazo, 'pendente')
+            on conflict (atividade_id, zona_id, periodo_inicio, periodo_fim) do nothing
+        """, {"atividade": atividade_id, "zona": z["id"], "inicio": inicio, "fim": fim, "prazo": prazo})
+        count += 1
+    registrar_auditoria("gerar_checklists", "simoc_atividades", atividade_id, f"{count} zonas")
+    return count
+
+
+def gerar_mensagens_atraso_automaticas() -> int:
+    atrasadas = rows("""
+        select c.id, c.zona_id, z.numero, a.descricao, c.prazo_preenchimento
+        from simoc_checklists c
+        join simoc_atividades a on a.id=c.atividade_id
+        join simoc_zonas z on z.id=c.zona_id
+        where c.status in ('pendente','devolvido') and c.prazo_preenchimento < :hoje
+    """, {"hoje": hoje_brasilia()})
+    criadas = 0
+    for r in atrasadas:
+        ja = scalar("""
+            select id from simoc_mensagens
+            where tipo='atraso_auto' and checklist_id=:cid and date(criada_em at time zone 'America/Sao_Paulo')=:hoje
+        """, {"cid": r["id"], "hoje": hoje_brasilia()})
+        if ja:
+            continue
+        execute("""
+            insert into simoc_mensagens (zona_id, titulo, mensagem, tipo, checklist_id, criada_por)
+            values (:zona, :titulo, :mensagem, 'atraso_auto', :cid, :uid)
+        """, {
+            "zona": r["zona_id"],
+            "titulo": "Checklist em atraso",
+            "mensagem": f"A atividade '{r['descricao']}' está pendente/devolvida após o prazo de {fmt_data(r['prazo_preenchimento'])}. Regularize o checklist ou registre observação justificando a pendência.",
+            "cid": r["id"],
+            "uid": (usuario_logado() or {}).get("id"),
+        })
+        criadas += 1
+    if criadas:
+        registrar_auditoria("mensagens_atraso_auto", "simoc_checklists", detalhe=str(criadas))
+    return criadas
+
+
+def df_checklists_filtrado(status="Todos", periodicidade="Todas", grupo="Todos", zona_id=None, inicio=None, fim=None):
+    cond = ["1=1"]
+    params = {}
+    if status != "Todos":
+        cond.append("c.status=:status")
+        params["status"] = status
+    if periodicidade != "Todas":
+        cond.append("a.periodicidade=:periodicidade")
+        params["periodicidade"] = periodicidade
+    if grupo != "Todos":
+        cond.append("a.grupo=:grupo")
+        params["grupo"] = grupo
+    if zona_id:
+        cond.append("c.zona_id=:zona")
+        params["zona"] = zona_id
+    if inicio:
+        cond.append("c.periodo_inicio>=:inicio")
+        params["inicio"] = inicio
+    if fim:
+        cond.append("c.periodo_fim<=:fim")
+        params["fim"] = fim
+    sql = f"""
+        select c.id, z.numero as zona, z.municipio_sede, a.grupo, a.descricao as atividade, a.periodicidade,
+               c.periodo_inicio, c.periodo_fim, c.prazo_preenchimento, c.status, c.responsavel_zona,
+               c.realizado, c.data_execucao, c.observacao_zona, c.evidencia_url, c.enviado_em,
+               c.comentario_corregedoria
+        from simoc_checklists c
+        join simoc_atividades a on a.id=c.atividade_id
+        join simoc_zonas z on z.id=c.zona_id
+        where {' and '.join(cond)}
+        order by c.prazo_preenchimento desc, z.numero, a.descricao
+    """
+    df = dataframe(sql, params)
+    if not df.empty:
+        for col in ["periodo_inicio", "periodo_fim", "prazo_preenchimento", "data_execucao", "enviado_em"]:
+            if col in df.columns:
+                df[col] = df[col].apply(fmt_data)
+    return df
+
+
+# ============================================================
+# PAGINAS CORREGEDORIA
+# ============================================================
+
+def pagina_inicio_corregedoria():
+    st.markdown("<div class='flow-box'><b>Fluxo correto:</b> a Corregedoria cadastra a atividade e a periodicidade → gera checklist para as Zonas → a Zona informa o responsável, observa e marca a realização → a Corregedoria acompanha, alerta e valida.</div>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        card("📌 Atividades monitoradas", "Cadastrar a atividade, periodicidade, período de execução e prazo para resposta das Zonas.")
+        if st.button("Abrir atividades", key="home_atividades"):
+            st.session_state.nav_cor = "Atividades"
+            st.rerun()
+    with c2:
+        card("📊 Acompanhamento", "Controlar atividades pendentes, realizadas, em análise e atrasadas por Zona Eleitoral.")
+        if st.button("Abrir acompanhamento", key="home_acomp"):
+            st.session_state.nav_cor = "Acompanhamento"
+            st.rerun()
+    with c3:
+        card("✉️ Comunicação", "Enviar mensagens às Zonas, inclusive orientações e cobranças de atraso.")
+        if st.button("Abrir mensagens", key="home_msg"):
+            st.session_state.nav_cor = "Mensagens"
+            st.rerun()
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        card("✅ Validação", "Validar ou devolver os checklists enviados pelas Zonas.")
+        if st.button("Validar checklists", key="home_val"):
+            st.session_state.nav_cor = "Validação"
+            st.rerun()
+    with c5:
+        card("📄 Relatórios", "Filtrar por Zona, status, periodicidade, grupo e período. Exportar Excel ou PDF.")
+        if st.button("Emitir relatórios", key="home_rel"):
+            st.session_state.nav_cor = "Relatórios"
+            st.rerun()
+    with c6:
+        card("💾 Backup", "Gerar backup completo do sistema em JSON e restaurar apenas com confirmação expressa.")
+        if st.button("Abrir backup", key="home_backup"):
+            st.session_state.nav_cor = "Backup"
             st.rerun()
 
 
-def nav_pages():
-    if eh_corregedoria():
-        return ["Início", "Atividades", "Acompanhamento", "Validar", "Zonas", "Relatórios", "Backup", "Usuários", "Auditoria"]
-    if eh_zona():
-        return ["Início", "Checklist", "Orientações"]
-    return ["Acompanhamento", "Zonas", "Relatórios"]
+def pagina_atividades():
+    st.subheader("Atividades monitoradas e geração de checklist")
+    st.caption("Cadastre a atividade, defina periodicidade e período. Ao salvar, o sistema gera o checklist para todas as Zonas ou para uma Zona específica.")
+    with st.form("form_nova_atividade"):
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            grupo = st.selectbox("Grupo", GRUPOS_PADRAO)
+            periodicidade = st.selectbox("Periodicidade", PERIODICIDADES)
+            prazo_dias = st.number_input("Prazo padrão em dias", min_value=0, max_value=365, value=5)
+            exige_evidencia = st.checkbox("Exigir link/evidência")
+        with c2:
+            descricao = st.text_area("Atividade a ser monitorada", placeholder="Ex.: RAE em diligência; Banco de Erros; PJe; Diário DJE...")
+            responsavel_ref = st.text_input("Responsável de referência da planilha", placeholder="Ex.: Emerson e Rosy; Juanil e Marcelo")
+            orientacao = st.text_area("Orientação da Corregedoria para a Zona")
+        st.markdown("**Período de execução e prazo para resposta**")
+        d1, d2, d3, d4 = st.columns(4)
+        with d1:
+            inicio = st.date_input("Início da execução", value=hoje_brasilia(), format="DD/MM/YYYY")
+        with d2:
+            fim = st.date_input("Fim da execução", value=hoje_brasilia(), format="DD/MM/YYYY")
+        with d3:
+            prazo = st.date_input("Prazo para a Zona preencher", value=hoje_brasilia() + timedelta(days=5), format="DD/MM/YYYY")
+        with d4:
+            destino = st.selectbox("Destino", zona_options(incluir_todas=True))
+        salvar = st.form_submit_button("Cadastrar atividade e gerar checklist", type="primary")
+    if salvar:
+        if not descricao.strip():
+            st.warning("Informe a atividade a ser monitorada.")
+        elif fim < inicio:
+            st.warning("A data final não pode ser anterior à inicial.")
+        else:
+            uid = (usuario_logado() or {}).get("id")
+            aid = scalar("""
+                insert into simoc_atividades (grupo, descricao, periodicidade, responsavel_referencia, prazo_dias, orientacao, exige_evidencia, criado_por)
+                values (:grupo, :descricao, :periodicidade, :resp, :prazo_dias, :orientacao, :exige, :uid)
+                returning id
+            """, {"grupo": grupo, "descricao": descricao.strip(), "periodicidade": periodicidade, "resp": responsavel_ref.strip(), "prazo_dias": int(prazo_dias), "orientacao": orientacao.strip(), "exige": exige_evidencia, "uid": uid})
+            qtd = gerar_checklists(aid, zona_id_from_label(destino), inicio, fim, prazo)
+            registrar_auditoria("cadastrar_atividade", "simoc_atividades", aid, descricao[:120])
+            st.success(f"Atividade cadastrada e checklist gerado para {qtd} Zona(s).")
 
-# ============================================================
-# CONSULTAS DE TAREFAS E RELATÓRIOS
-# ============================================================
+    st.markdown("---")
+    st.subheader("Atividades cadastradas")
+    df = dataframe("""
+        select id, grupo, descricao, periodicidade, responsavel_referencia, prazo_dias, ativa, criado_em
+        from simoc_atividades order by criado_em desc
+    """)
+    if not df.empty:
+        df["criado_em"] = df["criado_em"].apply(fmt_data)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
-def tarefas_sql(where_extra="", order="t.prazo asc, z.numero asc", limit=1000):
-    return f"""
-        select t.id as tarefa_id, lpad(z.numero::text,3,'0') || 'ª ZE' as zona, z.numero as zona_numero,
-               coalesce(z.municipio_sede,'A definir') as municipio_sede, i.grupo, i.descricao as atividade,
-               i.frequencia as periodicidade, i.responsavel_origem as responsavel_referencia,
-               i.orientacao_corregedoria, c.periodo_inicio, c.periodo_fim, t.prazo, t.status,
-               t.responsavel_atividade_zona, t.data_execucao, t.observacao_corregedoria,
-               t.criado_em, t.atualizado_em
-        from tarefas_zona t
-        join zonas_eleitorais z on z.id=t.zona_eleitoral_id
-        join itens_monitoramento i on i.id=t.item_monitoramento_id
-        join ciclos_monitoramento c on c.id=t.ciclo_id
-        where 1=1 {where_extra}
-        order by {order}
-        limit {int(limit)}
-    """
-
-
-def tarefas_df(status=None, zona_id=None, grupo=None, periodicidade=None, data_ini=None, data_fim=None, limit=1000):
-    clauses = []
-    params = {}
-    if status:
-        clauses.append("and t.status = any(:status)")
-        params["status"] = status
-    if zona_id:
-        clauses.append("and t.zona_eleitoral_id=:zona")
-        params["zona"] = zona_id
-    if grupo:
-        clauses.append("and i.grupo=:grupo")
-        params["grupo"] = grupo
-    if periodicidade:
-        clauses.append("and i.frequencia=:periodicidade")
-        params["periodicidade"] = periodicidade
-    if data_ini:
-        clauses.append("and c.periodo_fim >= :data_ini")
-        params["data_ini"] = data_ini
-    if data_fim:
-        clauses.append("and c.periodo_inicio <= :data_fim")
-        params["data_fim"] = data_fim
-    return dataframe(tarefas_sql(" ".join(clauses), limit=limit), **params)
-
-
-def status_real_tarefa(row) -> str:
-    try:
-        prazo = pd.to_datetime(row.get("prazo"), dayfirst=True).date() if not isinstance(row.get("prazo"), date) else row.get("prazo")
-        if row.get("status") == "pendente" and prazo and prazo < hoje_brasilia():
-            return "atrasado"
-    except Exception:
-        pass
-    return row.get("status") or "pendente"
-
-# ============================================================
-# PÁGINAS DA CORREGEDORIA
-# ============================================================
-
-def page_inicio_corregedoria():
-    st.markdown("""
-    <div class="banner corregedoria">
-        <h2>Interface da Corregedoria</h2>
-        <p><b>Fluxo:</b> cadastrar atividades monitoradas, definir periodicidade e período, gerar checklist para as Zonas, acompanhar realização e validar as respostas.</p>
-    </div>
-    <div class="step-flow">
-        <span>1. Cadastrar atividade</span><span>2. Definir periodicidade</span><span>3. Gerar checklist</span><span>4. Zona executa</span><span>5. Corregedoria valida</span>
-    </div>
-    """, unsafe_allow_html=True)
-    df = dataframe("select status, count(*) as total from tarefas_zona group by status")
-    totais = dict(zip(df.get("status", []), df.get("total", []))) if not df.empty else {}
-    cols = st.columns(5)
-    for col, label, key in zip(cols, ["Pendentes", "Em análise", "Validadas", "Devolvidas", "Total"], ["pendente", "em_analise", "validado", "devolvido", "total"]):
-        val = sum(totais.values()) if key == "total" else totais.get(key, 0)
-        col.markdown(f"<div class='metric-card'><div class='label'>{label}</div><div class='value'>{val}</div></div>", unsafe_allow_html=True)
-    st.info("Use a aba **Atividades** para cadastrar atividades e gerar checklist para as Zonas. A aba **Acompanhamento** mostra o controle de realização.")
+    with st.expander("Gerar novo período de checklist para atividade já cadastrada"):
+        atividades = rows("select id, descricao, periodicidade from simoc_atividades where ativa=true order by descricao")
+        if atividades:
+            opts = [f"{a['id']} | {a['descricao']} ({a['periodicidade']})" for a in atividades]
+            with st.form("form_periodo_existente"):
+                escolha = st.selectbox("Atividade", opts)
+                c1, c2, c3, c4 = st.columns(4)
+                with c1: inicio2 = st.date_input("Início", value=hoje_brasilia(), key="inicio2", format="DD/MM/YYYY")
+                with c2: fim2 = st.date_input("Fim", value=hoje_brasilia(), key="fim2", format="DD/MM/YYYY")
+                with c3: prazo2 = st.date_input("Prazo", value=hoje_brasilia()+timedelta(days=5), key="prazo2", format="DD/MM/YYYY")
+                with c4: destino2 = st.selectbox("Destino", zona_options(incluir_todas=True), key="destino2")
+                ok = st.form_submit_button("Gerar checklist do período")
+            if ok:
+                aid = int(escolha.split("|",1)[0].strip())
+                qtd = gerar_checklists(aid, zona_id_from_label(destino2), inicio2, fim2, prazo2)
+                st.success(f"Checklist gerado para {qtd} Zona(s).")
+        else:
+            st.info("Nenhuma atividade cadastrada.")
 
 
-def page_atividades():
-    st.header("Atividades monitoradas e geração de checklist")
-    st.caption("A Corregedoria cadastra a atividade, define periodicidade, período de execução e prazo para a Zona preencher. Depois gera o checklist para uma Zona ou todas as Zonas.")
-    aba_cadastro, aba_gerar, aba_lista = st.tabs(["Cadastrar atividade", "Gerar checklist para Zonas", "Atividades cadastradas"])
+def pagina_acompanhamento():
+    criadas = gerar_mensagens_atraso_automaticas()
+    if criadas:
+        alert("warn", f"Foram geradas {criadas} mensagem(ns) automática(s) de atraso para as Zonas.")
+    total = scalar("select count(*) from simoc_checklists") or 0
+    pend = scalar("select count(*) from simoc_checklists where status='pendente'") or 0
+    analise = scalar("select count(*) from simoc_checklists where status='em_analise'") or 0
+    valid = scalar("select count(*) from simoc_checklists where status='validado'") or 0
+    atras = scalar("select count(*) from simoc_checklists where status in ('pendente','devolvido') and prazo_preenchimento < :h", {"h": hoje_brasilia()}) or 0
+    c1,c2,c3,c4,c5 = st.columns(5)
+    with c1: metric_card("Total", total)
+    with c2: metric_card("Pendentes", pend)
+    with c3: metric_card("Em análise", analise)
+    with c4: metric_card("Validados", valid)
+    with c5: metric_card("Atrasados", atras)
+    if atras:
+        alert("danger", f"Há {atras} checklist(s) em atraso. As Zonas recebem alerta automático e a Corregedoria pode enviar mensagem manual.")
+    st.subheader("Controle de realização por Zona")
+    df = df_checklists_filtrado()
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
-    with aba_cadastro:
-        with st.form("form_item"):
+
+def pagina_validacao():
+    st.subheader("Validar checklists enviados pelas Zonas")
+    itens = rows("""
+        select c.id, z.numero, z.municipio_sede, a.descricao, a.periodicidade, c.periodo_inicio, c.periodo_fim,
+               c.responsavel_zona, c.data_execucao, c.observacao_zona, c.evidencia_url, c.enviado_em, c.status
+        from simoc_checklists c
+        join simoc_atividades a on a.id=c.atividade_id
+        join simoc_zonas z on z.id=c.zona_id
+        where c.status='em_analise'
+        order by c.enviado_em nulls last, z.numero
+    """)
+    if not itens:
+        st.info("Nenhum checklist aguardando validação.")
+        return
+    for r in itens:
+        with st.expander(f"Zona {int(r['numero']):03d} - {r['municipio_sede']} | {r['descricao']}"):
+            st.write(f"**Periodicidade:** {r['periodicidade']} | **Período:** {fmt_data(r['periodo_inicio'])} a {fmt_data(r['periodo_fim'])}")
+            st.write(f"**Responsável na Zona:** {r.get('responsavel_zona') or '-'}")
+            st.write(f"**Data de execução:** {fmt_data(r.get('data_execucao'))}")
+            st.write(f"**Observação da Zona:** {r.get('observacao_zona') or '-'}")
+            if r.get("evidencia_url"):
+                st.write(f"**Evidência/SEI:** {r['evidencia_url']}")
+            comentario = st.text_area("Comentário da Corregedoria", key=f"coment_val_{r['id']}")
             c1, c2 = st.columns(2)
             with c1:
-                grupo = st.selectbox("Grupo", GRUPOS_PADRAO)
-                descricao = st.text_area("Atividade a ser monitorada", height=120, placeholder="Ex.: RAE em diligência")
-                periodicidade = st.selectbox("Periodicidade de acompanhamento", PERIODICIDADES)
-                responsavel_ref = st.text_input("Responsável de referência da planilha", placeholder="Ex.: Emerson e Rosy")
+                if st.button("Validar", key=f"validar_{r['id']}"):
+                    execute("""
+                        update simoc_checklists set status='validado', validado_em=now(), validado_por=:uid,
+                        comentario_corregedoria=:c, atualizado_em=now() where id=:id
+                    """, {"uid": usuario_logado()["id"], "c": comentario, "id": r["id"]})
+                    registrar_auditoria("validar_checklist", "simoc_checklists", r["id"])
+                    st.success("Checklist validado.")
+                    st.rerun()
             with c2:
-                prazo_padrao = st.number_input("Prazo padrão para preenchimento pela Zona, em dias", min_value=0, max_value=365, value=7)
-                exige_evidencia = st.checkbox("Exigir evidência/link SEI/comprovante", value=False)
-                criticidade = st.selectbox("Criticidade", ["baixa", "media", "alta"], index=1)
-                ativo = st.checkbox("Atividade ativa", value=True)
-            orientacao = st.text_area("Orientação da Corregedoria para a Zona", height=120)
-            salvar = st.form_submit_button("Salvar atividade monitorada", type="primary")
-        if salvar:
-            if not descricao.strip():
-                st.warning("Informe a atividade.")
-            else:
-                with db_session() as conn:
-                    item_id = conn.execute(text("""
-                        insert into itens_monitoramento (grupo, descricao, responsavel_origem, frequencia, exige_evidencia, criticidade, ativo, orientacao_corregedoria, prazo_padrao_dias, atualizado_em)
-                        values (:grupo,:desc,:resp,:freq,:evid,:crit,:ativo,:orient,:prazo,(now() at time zone 'America/Sao_Paulo'))
-                        on conflict (grupo, descricao) do update set
-                          responsavel_origem=excluded.responsavel_origem,
-                          frequencia=excluded.frequencia,
-                          exige_evidencia=excluded.exige_evidencia,
-                          criticidade=excluded.criticidade,
-                          ativo=excluded.ativo,
-                          orientacao_corregedoria=excluded.orientacao_corregedoria,
-                          prazo_padrao_dias=excluded.prazo_padrao_dias,
-                          atualizado_em=(now() at time zone 'America/Sao_Paulo')
-                        returning id
-                    """), {"grupo": grupo, "desc": descricao.strip(), "resp": responsavel_ref.strip(), "freq": periodicidade, "evid": exige_evidencia, "crit": criticidade, "ativo": ativo, "orient": orientacao, "prazo": int(prazo_padrao)}).scalar_one()
-                registrar_auditoria("salvar_atividade_monitorada", "itens_monitoramento", item_id, descricao[:120])
-                st.success("Atividade salva. Agora gere o checklist para as Zonas na próxima aba.")
+                if st.button("Devolver para ajuste", key=f"devolver_{r['id']}"):
+                    execute("""
+                        update simoc_checklists set status='devolvido', comentario_corregedoria=:c, atualizado_em=now() where id=:id
+                    """, {"c": comentario or "Devolvido para ajuste pela Corregedoria.", "id": r["id"]})
+                    execute("""
+                        insert into simoc_mensagens (zona_id, titulo, mensagem, tipo, checklist_id, criada_por)
+                        values ((select zona_id from simoc_checklists where id=:id), 'Checklist devolvido', :msg, 'devolucao', :id, :uid)
+                    """, {"id": r["id"], "msg": comentario or "Checklist devolvido para ajuste.", "uid": usuario_logado()["id"]})
+                    registrar_auditoria("devolver_checklist", "simoc_checklists", r["id"])
+                    st.warning("Checklist devolvido e mensagem enviada à Zona.")
+                    st.rerun()
 
-    with aba_gerar:
-        itens = dataframe("select id, grupo || ' - ' || descricao || ' [' || frequencia || ']' as label, prazo_padrao_dias from itens_monitoramento where ativo=true order by grupo, descricao")
-        if itens.empty:
-            st.warning("Cadastre uma atividade antes de gerar checklist.")
+
+def pagina_mensagens_corregedoria():
+    st.subheader("Comunicação da Corregedoria com as Zonas")
+    with st.form("form_msg"):
+        destino = st.selectbox("Destino", zona_options(incluir_todas=True))
+        titulo = st.text_input("Título")
+        msg = st.text_area("Mensagem à Zona")
+        enviar = st.form_submit_button("Enviar mensagem", type="primary")
+    if enviar:
+        if not titulo.strip() or not msg.strip():
+            st.warning("Informe título e mensagem.")
         else:
-            with st.form("form_gerar_checklist"):
-                item_label = st.selectbox("Atividade", itens["label"].tolist())
-                item_id = int(itens.loc[itens["label"] == item_label, "id"].iloc[0])
-                prazo_padrao = int(itens.loc[itens["label"] == item_label, "prazo_padrao_dias"].iloc[0] or 0)
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    periodo_inicio = st.date_input("Início do período de execução", value=hoje_brasilia(), format="DD/MM/YYYY")
-                with c2:
-                    periodo_fim = st.date_input("Fim do período de execução", value=hoje_brasilia(), format="DD/MM/YYYY")
-                with c3:
-                    prazo = st.date_input("Prazo para a Zona preencher", value=hoje_brasilia() + timedelta(days=prazo_padrao or 7), format="DD/MM/YYYY")
-                destino_tipo = st.radio("Destino", ["Todas as Zonas", "Apenas uma Zona"], horizontal=True)
-                zona_id = None
-                if destino_tipo == "Apenas uma Zona":
-                    zopts = zonas_options()
-                    label = st.selectbox("Zona de destino", [lbl for _, lbl in zopts])
-                    for zid, lbl in zopts:
-                        if lbl == label:
-                            zona_id = zid
-                gerar = st.form_submit_button("Gerar checklist", type="primary")
-            if gerar:
-                if periodo_fim < periodo_inicio:
-                    st.warning("O fim do período não pode ser anterior ao início.")
-                elif prazo < periodo_inicio:
-                    st.warning("O prazo deve ser igual ou posterior ao início do período.")
-                else:
-                    with db_session() as conn:
-                        periodicidade = conn.execute(text("select frequencia from itens_monitoramento where id=:id"), {"id": item_id}).scalar_one()
-                        ciclo_id = conn.execute(text("""
-                            insert into ciclos_monitoramento (periodo_inicio, periodo_fim, tipo_periodicidade, status, criado_em)
-                            values (:ini,:fim,:tipo,'aberto',(now() at time zone 'America/Sao_Paulo'))
-                            on conflict (periodo_inicio, periodo_fim, tipo_periodicidade) do update set status='aberto'
-                            returning id
-                        """), {"ini": periodo_inicio, "fim": periodo_fim, "tipo": periodicidade}).scalar_one()
-                        if destino_tipo == "Todas as Zonas":
-                            zonas = conn.execute(text("select id from zonas_eleitorais where ativa=true order by numero")).scalars().all()
-                        else:
-                            zonas = [zona_id]
-                        criadas = 0
-                        for zid in zonas:
-                            if zid:
-                                res = conn.execute(text("""
-                                    insert into tarefas_zona (zona_eleitoral_id, item_monitoramento_id, ciclo_id, prazo, status, criado_em, atualizado_em)
-                                    values (:z,:item,:ciclo,:prazo,'pendente',(now() at time zone 'America/Sao_Paulo'),(now() at time zone 'America/Sao_Paulo'))
-                                    on conflict (zona_eleitoral_id, item_monitoramento_id, ciclo_id) do nothing
-                                """), {"z": zid, "item": item_id, "ciclo": ciclo_id, "prazo": prazo})
-                                criadas += res.rowcount or 0
-                    registrar_auditoria("gerar_checklist_zonas", "tarefas_zona", None, f"item={item_id}; criadas={criadas}")
-                    st.success(f"Checklist gerado. Novas tarefas criadas: {criadas}. Tarefas já existentes foram preservadas.")
-
-    with aba_lista:
-        filtro = st.text_input("Filtrar atividade")
-        st.dataframe(dataframe("""
-            select id, grupo, descricao as atividade, frequencia as periodicidade, responsavel_origem as responsavel_referencia,
-                   prazo_padrao_dias, exige_evidencia, criticidade, ativo, orientacao_corregedoria, atualizado_em
-            from itens_monitoramento
-            where (:filtro='' or descricao ilike :like or grupo ilike :like or coalesce(responsavel_origem,'') ilike :like)
-            order by grupo, descricao
-        """, filtro=filtro, like=f"%{filtro}%"), use_container_width=True, hide_index=True)
-
-
-def page_acompanhamento():
-    st.header("Acompanhamento da realização pelas Zonas")
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        status = st.multiselect("Status", STATUS_TAREFA, default=["pendente", "atrasado", "em_analise", "devolvido"])
-    with c2:
-        periodicidade = st.selectbox("Periodicidade", ["Todas"] + PERIODICIDADES)
-    with c3:
-        grupo = st.selectbox("Grupo", ["Todos"] + GRUPOS_PADRAO)
-    with c4:
-        limite = st.number_input("Limite", 50, 5000, 500, 50)
-    zopts = zonas_options(incluir_todas=True)
-    zona_label = st.selectbox("Zona", [lbl for _, lbl in zopts]) if zopts else "Todas as Zonas"
-    zona_id = next((zid for zid, lbl in zopts if lbl == zona_label), None)
-    df = tarefas_df(status=status or None, zona_id=zona_id, grupo=None if grupo == "Todos" else grupo, periodicidade=None if periodicidade == "Todas" else periodicidade, limit=int(limite))
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-
-def page_validacao():
-    st.header("Validar checklist enviado pela Zona")
+            if destino == "Todas as Zonas":
+                zonas = rows("select id from simoc_zonas where ativa=true")
+            else:
+                zonas = [{"id": zona_id_from_label(destino)}]
+            for z in zonas:
+                execute("""
+                    insert into simoc_mensagens (zona_id, titulo, mensagem, tipo, criada_por)
+                    values (:zona, :titulo, :mensagem, 'manual', :uid)
+                """, {"zona": z["id"], "titulo": titulo.strip(), "mensagem": msg.strip(), "uid": usuario_logado()["id"]})
+            registrar_auditoria("enviar_mensagem", "simoc_mensagens", detalhe=destino)
+            st.success(f"Mensagem enviada para {len(zonas)} Zona(s).")
+    st.markdown("---")
     df = dataframe("""
-        select distinct on (r.tarefa_zona_id) r.id as resposta_id, t.id as tarefa_id,
-               lpad(z.numero::text,3,'0') || 'ª ZE' as zona, z.municipio_sede, i.grupo, i.descricao as atividade,
-               i.frequencia as periodicidade, t.responsavel_atividade_zona, t.data_execucao, r.status as resposta,
-               r.observacao, r.justificativa, r.evidencia_url, r.enviado_em
-        from respostas r
-        join tarefas_zona t on t.id=r.tarefa_zona_id
-        join zonas_eleitorais z on z.id=t.zona_eleitoral_id
-        join itens_monitoramento i on i.id=t.item_monitoramento_id
-        where t.status='em_analise'
-        order by r.tarefa_zona_id, r.enviado_em desc
-        limit 500
+        select m.id, z.numero as zona, z.municipio_sede, m.titulo, m.tipo, m.criada_em, m.lida_em
+        from simoc_mensagens m left join simoc_zonas z on z.id=m.zona_id
+        order by m.criada_em desc limit 200
     """)
+    if not df.empty:
+        df["criada_em"] = df["criada_em"].apply(fmt_data)
+        df["lida_em"] = df["lida_em"].apply(fmt_data)
     st.dataframe(df, use_container_width=True, hide_index=True)
-    if df.empty:
-        st.success("Não há checklists aguardando validação.")
-        return
-    resposta_id = st.selectbox("Resposta a decidir", df["resposta_id"].tolist())
-    tarefa_id = int(df.loc[df["resposta_id"] == resposta_id, "tarefa_id"].iloc[0])
-    acao = st.radio("Decisão da Corregedoria", ["validado", "devolvido"], horizontal=True)
-    obs = st.text_area("Observação da Corregedoria")
-    if st.button("Registrar decisão", type="primary"):
-        with db_session() as conn:
-            conn.execute(text("""
-                insert into validacoes_corregedoria (resposta_id, usuario_corregedoria_id, status_validacao, observacao, validado_em)
-                values (:resposta,:usuario,:status,:obs,(now() at time zone 'America/Sao_Paulo'))
-            """), {"resposta": int(resposta_id), "usuario": usuario_logado()["id"], "status": acao, "obs": obs})
-            conn.execute(text("update tarefas_zona set status=:status, observacao_corregedoria=:obs, atualizado_em=(now() at time zone 'America/Sao_Paulo') where id=:id"), {"status": acao, "obs": obs, "id": tarefa_id})
-        registrar_auditoria("corregedoria_valida_checklist", "tarefas_zona", tarefa_id, acao)
-        st.success("Decisão registrada.")
-        st.rerun()
-
-# ============================================================
-# PÁGINAS DA ZONA
-# ============================================================
-
-def page_inicio_zona():
-    u = usuario_logado()
-    st.markdown("""
-    <div class="banner zona">
-        <h2>Interface da Zona Eleitoral</h2>
-        <p><b>Função da Zona:</b> executar as atividades encaminhadas pela Corregedoria, informar o responsável local, marcar o checklist e enviar para análise.</p>
-    </div>
-    <div class="step-flow">
-        <span>1. Ver checklist</span><span>2. Executar atividade</span><span>3. Informar responsável</span><span>4. Marcar realização</span><span>5. Enviar à Corregedoria</span>
-    </div>
-    """, unsafe_allow_html=True)
-    if not u.get("zona_eleitoral_id"):
-        st.warning("Seu usuário ainda não está vinculado a uma Zona Eleitoral. Solicite ajuste à Corregedoria.")
-        return
-    df = tarefas_df(zona_id=u.get("zona_eleitoral_id"), limit=1000)
-    st.write(f"Tarefas vinculadas à sua Zona: **{len(df)}**")
-    st.dataframe(df.head(20), use_container_width=True, hide_index=True)
 
 
-def page_checklist_zona():
-    st.header("Checklist da Zona")
-    user = usuario_logado()
-    zona_id = user.get("zona_eleitoral_id")
-    if not zona_id:
-        st.error("Usuário sem Zona vinculada. A Corregedoria precisa vincular seu cadastro a uma Zona Eleitoral.")
-        return
-    c1, c2 = st.columns(2)
-    with c1:
-        status = st.multiselect("Status", ["pendente", "devolvido", "em_analise", "validado"], default=["pendente", "devolvido"])
-    with c2:
-        periodicidade = st.selectbox("Periodicidade", ["Todas"] + PERIODICIDADES)
-    df = tarefas_df(status=status or None, zona_id=zona_id, periodicidade=None if periodicidade == "Todas" else periodicidade, limit=500)
+def pagina_zonas():
+    st.subheader("Zonas Eleitorais e município-sede")
+    st.caption("Para fins de controle, cada Zona é vinculada ao município-sede. Quando houver mais de um município abrangido, considere apenas a sede.")
+    df = dataframe("select id, numero, nome, municipio_sede, email, ativa from simoc_zonas order by numero")
     st.dataframe(df, use_container_width=True, hide_index=True)
-    if df.empty:
-        st.info("Não há tarefas para preencher com os filtros atuais.")
-        return
-    tarefa_id = st.selectbox("Selecionar tarefa para preencher", df["tarefa_id"].tolist())
-    linha = df[df["tarefa_id"] == tarefa_id].iloc[0].to_dict()
-    st.markdown(f"""
-    <div class="card">
-        <h3>{linha.get('atividade')}</h3>
-        <p><b>Grupo:</b> {linha.get('grupo')} · <b>Periodicidade:</b> {linha.get('periodicidade')} · <b>Prazo:</b> {linha.get('prazo')}</p>
-        <p><b>Orientação da Corregedoria:</b> {linha.get('orientacao_corregedoria') or 'Sem orientação específica.'}</p>
-    </div>
-    """, unsafe_allow_html=True)
-    with st.form("preencher_checklist"):
-        responsavel = st.text_input("Responsável pela atividade na Zona", value=linha.get("responsavel_atividade_zona") or "")
-        data_exec = st.date_input("Data de execução/conferência", value=hoje_brasilia(), format="DD/MM/YYYY")
-        status_resposta = st.selectbox("Resultado do checklist", STATUS_CHECKLIST_ZONA)
-        obs = st.text_area("Observação")
-        justificativa = st.text_area("Justificativa, se houver")
-        evidencia = st.text_input("Link da evidência, documento SEI ou comprovante")
-        enviado = st.form_submit_button("Enviar para a Corregedoria", type="primary")
-    if enviado:
-        if not responsavel.strip():
-            st.warning("Informe o responsável pela atividade na Zona.")
-            return
-        with db_session() as conn:
-            conn.execute(text("""
-                insert into respostas (tarefa_zona_id, usuario_id, status, observacao, justificativa, evidencia_url, enviado_em)
-                values (:tarefa,:usuario,:status,:obs,:just,:evid,(now() at time zone 'America/Sao_Paulo'))
-            """), {"tarefa": int(tarefa_id), "usuario": user["id"], "status": status_resposta, "obs": obs, "just": justificativa, "evid": evidencia})
-            novo = "em_analise" if status_resposta in ["cumprido", "cumprido_com_ressalva", "nao_se_aplica"] else "pendente"
-            conn.execute(text("""
-                update tarefas_zona set status=:status, responsavel_atividade_zona=:resp, data_execucao=:data_exec,
-                atualizado_em=(now() at time zone 'America/Sao_Paulo') where id=:id
-            """), {"status": novo, "resp": responsavel.strip(), "data_exec": data_exec, "id": int(tarefa_id)})
-        registrar_auditoria("zona_marca_checklist", "tarefas_zona", int(tarefa_id), f"{status_resposta} - {responsavel}")
-        st.success("Checklist enviado para visualização/validação da Corregedoria.")
-        st.rerun()
-
-# ============================================================
-# ZONAS, USUÁRIOS, RELATÓRIOS, BACKUP E AUDITORIA
-# ============================================================
-
-def page_zonas():
-    st.header("Zonas Eleitorais da Bahia")
-    st.info("Cada Zona fica vinculada ao município-sede. Quando houver mais de um município abrangido, para fins de controle o sistema considera a sede.")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Garantir relação 001 a 205", use_container_width=True):
-            with db_session() as conn:
-                total = seed_zonas_bahia_padrao(conn)
-            st.success(f"Relação-base garantida: {total} zonas. Nenhum dado existente foi apagado.")
-    with c2:
-        if st.button("Importar/atualizar município-sede pelo TRE-BA", use_container_width=True):
-            with st.spinner("Consultando página pública do TRE-BA..."):
-                total = importar_zonas(TREBA_CONSULTA_CARTORIOS_URL)
-            st.success(f"Importação concluída: {total} zonas atualizadas.")
-    filtro = st.text_input("Filtrar Zona ou município-sede")
-    st.dataframe(dataframe("""
-        select id, lpad(numero::text,3,'0') as zona, municipio_sede, municipios_abrangidos, email, telefone, chefe_cartorio, juiz_eleitoral, ativa
-        from zonas_eleitorais
-        where (:filtro='' or cast(numero as text) like :like or coalesce(municipio_sede,'') ilike :like)
-        order by numero
-    """, filtro=filtro, like=f"%{filtro}%"), use_container_width=True, hide_index=True)
+    with st.expander("Atualizar município-sede/e-mail de uma Zona"):
+        with st.form("form_zona"):
+            zlabel = st.selectbox("Zona", zona_options())
+            sede = st.text_input("Município-sede")
+            email = st.text_input("E-mail da Zona")
+            ok = st.form_submit_button("Salvar dados da Zona")
+        if ok:
+            zid = zona_id_from_label(zlabel)
+            execute("update simoc_zonas set municipio_sede=:sede, email=:email where id=:id", {"sede": sede.strip(), "email": normalizar_email(email), "id": zid})
+            registrar_auditoria("atualizar_zona", "simoc_zonas", zid)
+            st.success("Zona atualizada.")
+            st.rerun()
 
 
-def page_usuarios():
-    st.header("Usuários e vinculação de Zona")
-    if not eh_corregedoria():
-        st.error("Apenas a Corregedoria administra usuários.")
-        return
-    with st.form("usuario"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            nome = st.text_input("Nome")
-            email = normalizar_email(st.text_input("E-mail"))
-            senha = st.text_input("Senha inicial ou nova senha", type="password")
-        with c2:
-            perfil = st.selectbox("Perfil", [p[0] for p in PERFIS])
-            ativo = st.checkbox("Ativo", value=True)
-            validado = st.checkbox("Validado", value=True)
-        with c3:
-            zopts = zonas_options()
-            zona_id = None
-            label = st.selectbox("Zona vinculada, se perfil de Zona", ["Sem zona"] + [lbl for _, lbl in zopts])
-            if label != "Sem zona":
-                zona_id = next((zid for zid, lbl in zopts if lbl == label), None)
-        salvar = st.form_submit_button("Salvar usuário", type="primary")
-    if salvar:
-        if not nome or not email:
-            st.warning("Informe nome e e-mail.")
-            return
-        with db_session() as conn:
-            perfil_id = conn.execute(text("select id from perfis where nome=:p"), {"p": perfil}).scalar_one()
-            existe = conn.execute(text("select id from usuarios where email=:e"), {"e": email}).scalar()
-            if existe:
-                params = {"n": nome, "p": perfil_id, "z": zona_id, "a": ativo, "v": validado, "e": email}
-                if senha:
-                    params["s"] = hash_password(senha)
-                    sql = """
-                        update usuarios set nome=:n, perfil_id=:p, zona_eleitoral_id=:z, ativo=:a, validado=:v, senha_hash=:s,
-                        atualizado_em=(now() at time zone 'America/Sao_Paulo') where email=:e
-                    """
-                else:
-                    sql = """
-                        update usuarios set nome=:n, perfil_id=:p, zona_eleitoral_id=:z, ativo=:a, validado=:v,
-                        atualizado_em=(now() at time zone 'America/Sao_Paulo') where email=:e
-                    """
-                conn.execute(text(sql), params)
-            else:
-                if not senha:
-                    st.warning("Informe senha inicial para novo usuário.")
-                    return
-                conn.execute(text("""
-                    insert into usuarios (nome,email,senha_hash,perfil_id,zona_eleitoral_id,ativo,validado,secao_operador)
-                    values (:n,:e,:s,:p,:z,:a,:v,:secao)
-                """), {"n": nome, "e": email, "s": hash_password(senha), "p": perfil_id, "z": zona_id, "a": ativo, "v": validado, "secao": UNIDADE_CORREGEDORIA})
-        registrar_auditoria("salvar_usuario", "usuarios", None, email)
-        st.success("Usuário salvo.")
-    st.dataframe(dataframe("""
-        select u.nome, u.email, p.nome as perfil, lpad(z.numero::text,3,'0') || 'ª ZE - ' || coalesce(z.municipio_sede,'A definir') as zona, u.ativo, u.validado, u.ultimo_login
-        from usuarios u join perfis p on p.id=u.perfil_id left join zonas_eleitorais z on z.id=u.zona_eleitoral_id
-        order by p.nome, u.nome
-    """), use_container_width=True, hide_index=True)
-
-
-def montar_backup_completo() -> dict:
-    backup = {
-        "sistema": NOME_SISTEMA,
-        "versao_backup": "simoc-ba-1.0",
-        "gerado_em_brasilia": agora_brasilia().isoformat(),
-        "tabelas": {},
-    }
-    with db_session() as conn:
-        for tabela in TABELAS_BACKUP:
-            try:
-                rows = conn.execute(text(f"select * from {tabela}")).mappings().all()
-                backup["tabelas"][tabela] = [dict(r) for r in rows]
-            except Exception:
-                backup["tabelas"][tabela] = []
-    return backup
-
-
-def bytes_json(obj: dict) -> bytes:
-    def default(o):
-        if isinstance(o, (datetime, date)):
-            return o.isoformat()
-        return str(o)
-    return json.dumps(obj, ensure_ascii=False, indent=2, default=default).encode("utf-8")
-
-
-def page_backup():
-    st.header("Backup e restauração")
-    st.markdown("<div class='ok-box'><b>Backup seguro:</b> a geração de backup apenas lê os dados do Supabase e baixa um arquivo JSON. Não apaga nada.</div>", unsafe_allow_html=True)
-    if st.button("Gerar backup completo agora", type="primary"):
-        backup = montar_backup_completo()
-        conteudo = bytes_json(backup)
-        nome = f"backup_simoc_ba_{agora_brasilia().strftime('%Y%m%d_%H%M%S')}.json"
-        digest = hashlib.sha256(conteudo).hexdigest()
-        with db_session() as conn:
-            conn.execute(text("""
-                insert into backups_registros (nome_arquivo, tipo, quantidade_registros, gerado_por_usuario_id, gerado_por_nome, gerado_por_email, hash_sha256, criado_em)
-                values (:nome,'json',:qtd,:uid,:unome,:email,:hash,(now() at time zone 'America/Sao_Paulo'))
-            """), {"nome": nome, "qtd": sum(len(v) for v in backup["tabelas"].values()), "uid": usuario_logado().get("id"), "unome": usuario_logado().get("nome"), "email": usuario_logado().get("email"), "hash": digest})
-        st.download_button("Baixar backup JSON", data=conteudo, file_name=nome, mime="application/json")
-        st.success("Backup gerado. Guarde o arquivo em local seguro.")
-    st.subheader("Restauração controlada")
-    st.warning("Restauração pode alterar dados. Use apenas com orientação e após gerar backup atual.")
-    arq = st.file_uploader("Selecionar backup JSON", type=["json"])
-    confirm = st.text_input("Para habilitar restauração, digite: CONFIRMO RESTAURAR")
-    if st.button("Restaurar backup selecionado"):
-        if confirm != "CONFIRMO RESTAURAR":
-            st.error("Confirmação não informada corretamente.")
-        elif arq is None:
-            st.error("Selecione um arquivo de backup.")
-        else:
-            dados = json.loads(arq.read().decode("utf-8"))
-            tabelas = dados.get("tabelas", {})
-            with db_session() as conn:
-                # Restauração conservadora: usa DELETE/INSERT apenas em tabelas de operação. Perfis e zonas são preservados por segurança.
-                for tabela in ["respostas", "validacoes_corregedoria", "comentarios_tarefa", "anexos_tarefa", "tarefas_zona", "ciclos_monitoramento", "itens_monitoramento"]:
-                    rows = tabelas.get(tabela, [])
-                    if not rows:
-                        continue
-                    conn.execute(text(f"delete from {tabela}"))
-                    for row in rows:
-                        cols = list(row.keys())
-                        sql_cols = ",".join(cols)
-                        sql_vals = ",".join([f":{c}" for c in cols])
-                        conn.execute(text(f"insert into {tabela} ({sql_cols}) values ({sql_vals})"), row)
-            registrar_auditoria("restaurar_backup", "backup", None, "restauração controlada")
-            st.success("Backup restaurado parcialmente com segurança. Perfis, usuários e zonas foram preservados.")
-
-
-def aplicar_filtros_relatorio():
-    st.subheader("Filtros do relatório")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        status = st.multiselect("Status", STATUS_TAREFA)
-        periodicidade = st.selectbox("Periodicidade", ["Todas"] + PERIODICIDADES)
-    with c2:
-        grupo = st.selectbox("Grupo", ["Todos"] + GRUPOS_PADRAO)
-        data_ini = st.date_input("Período de/desde", value=None, format="DD/MM/YYYY")
-    with c3:
-        zopts = zonas_options(incluir_todas=True)
-        zona_label = st.selectbox("Zona", [lbl for _, lbl in zopts]) if zopts else "Todas as Zonas"
-        data_fim = st.date_input("Período até", value=None, format="DD/MM/YYYY")
-    zona_id = next((zid for zid, lbl in zopts if lbl == zona_label), None) if zopts else None
-    df = tarefas_df(
-        status=status or None,
-        zona_id=zona_id,
-        grupo=None if grupo == "Todos" else grupo,
-        periodicidade=None if periodicidade == "Todas" else periodicidade,
-        data_ini=data_ini,
-        data_fim=data_fim,
-        limit=5000,
-    )
-    filtros = {"Status": status or "Todos", "Periodicidade": periodicidade, "Grupo": grupo, "Zona": zona_label, "Período inicial": fmt_data(data_ini), "Período final": fmt_data(data_fim)}
-    return df, filtros
-
-
-def page_relatorios():
-    st.header("Relatórios")
-    df, filtros = aplicar_filtros_relatorio()
-    st.write(f"Registros encontrados: **{len(df)}**")
+def pagina_usuarios():
+    st.subheader("Usuários")
+    df = dataframe("""
+        select u.id, u.nome, u.email, u.perfil, z.numero as zona, z.municipio_sede, u.ativo, u.validado, u.ultimo_login, u.criado_em
+        from simoc_usuarios u left join simoc_zonas z on z.id=u.zona_id
+        order by u.criado_em desc
+    """)
+    if not df.empty:
+        df["ultimo_login"] = df["ultimo_login"].apply(fmt_data)
+        df["criado_em"] = df["criado_em"].apply(fmt_data)
     st.dataframe(df, use_container_width=True, hide_index=True)
+    pendentes = rows("select id, nome, email from simoc_usuarios where validado=false and ativo=true order by criado_em")
+    if pendentes:
+        st.markdown("### Cadastros pendentes")
+        for u in pendentes:
+            c1, c2 = st.columns([3,1])
+            with c1: st.write(f"{u['nome']} - {u['email']}")
+            with c2:
+                if st.button("Validar usuário", key=f"valid_user_{u['id']}"):
+                    execute("update simoc_usuarios set validado=true, token_validacao=null, atualizado_em=now() where id=:id", {"id": u["id"]})
+                    registrar_auditoria("validar_usuario_admin", "simoc_usuarios", u["id"], u["email"])
+                    st.success("Usuário validado.")
+                    st.rerun()
+
+
+def gerar_pdf(df: pd.DataFrame) -> bytes:
     buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Relatório")
-        pd.DataFrame([filtros]).to_excel(writer, index=False, sheet_name="Filtros")
-    st.download_button("Baixar Excel", data=buffer.getvalue(), file_name="relatorio_simoc_ba.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    if st.button("Gerar PDF simplificado"):
-        from reportlab.lib.pagesizes import A4, landscape
-        from reportlab.lib import colors
-        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-        from reportlab.lib.styles import getSampleStyleSheet
-        pdf = BytesIO()
-        doc = SimpleDocTemplate(pdf, pagesize=landscape(A4))
-        styles = getSampleStyleSheet()
-        elems = [Paragraph("Relatório SIMOC-BA", styles["Title"]), Paragraph("Filtros: " + " | ".join([f"{k}: {v}" for k,v in filtros.items()]), styles["Normal"]), Spacer(1, 12)]
-        cols = ["zona", "municipio_sede", "grupo", "atividade", "periodicidade", "prazo", "status", "responsavel_atividade_zona"]
-        base = df[[c for c in cols if c in df.columns]].head(80)
-        data = [base.columns.tolist()] + base.fillna("").astype(str).values.tolist()
-        tbl = Table(data, repeatRows=1)
-        tbl.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor("#174A7C")), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("GRID", (0,0), (-1,-1), 0.25, colors.grey), ("FONTSIZE", (0,0), (-1,-1), 7)]))
-        elems.append(tbl)
-        doc.build(elems)
-        st.download_button("Baixar PDF", data=pdf.getvalue(), file_name="relatorio_simoc_ba.pdf", mime="application/pdf")
-
-
-def page_orientacoes():
-    st.header("Orientações")
-    if eh_corregedoria():
-        st.write("A Corregedoria deve cadastrar atividades claras, com periodicidade, período de execução, prazo e orientação objetiva para a Zona.")
-        st.info("Evite cadastrar atividades duplicadas. Para repetir o acompanhamento, gere um novo checklist com novo período de execução.")
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), rightMargin=20, leftMargin=20, topMargin=20, bottomMargin=20)
+    styles = getSampleStyleSheet()
+    elems = [Paragraph("SIMOC-BA - Relatório de Checklists", styles["Title"]), Spacer(1, 12)]
+    if df.empty:
+        elems.append(Paragraph("Nenhum registro encontrado.", styles["Normal"]))
     else:
-        st.write("A Zona deve cumprir a atividade, informar o responsável local e enviar o checklist para análise da Corregedoria.")
-        st.info("Se a atividade não se aplicar à Zona, marque 'não se aplica' e registre justificativa.")
+        cols = [c for c in ["zona", "municipio_sede", "grupo", "atividade", "periodicidade", "prazo_preenchimento", "status", "responsavel_zona"] if c in df.columns]
+        data = [cols] + df[cols].astype(str).values.tolist()[:80]
+        table = Table(data, repeatRows=1)
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#123E66")),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("GRID", (0,0), (-1,-1), .25, colors.grey),
+            ("FONTSIZE", (0,0), (-1,-1), 7),
+        ]))
+        elems.append(table)
+    doc.build(elems)
+    return buffer.getvalue()
 
 
-def page_auditoria():
-    st.header("Auditoria")
-    st.dataframe(dataframe("select criado_em, usuario_nome, usuario_email, acao, entidade, entidade_id, detalhe from logs_auditoria order by criado_em desc limit 1000"), use_container_width=True, hide_index=True)
+def pagina_relatorios():
+    st.subheader("Relatórios com filtros")
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
+    with c1: status = st.selectbox("Status", ["Todos"] + STATUS_CHECKLIST)
+    with c2: periodicidade = st.selectbox("Periodicidade", ["Todas"] + PERIODICIDADES)
+    with c3: grupo = st.selectbox("Grupo", ["Todos"] + GRUPOS_PADRAO)
+    with c4: zlabel = st.selectbox("Zona", zona_options(incluir_todas=True))
+    with c5: inicio = st.date_input("Início", value=None, format="DD/MM/YYYY")
+    with c6: fim = st.date_input("Fim", value=None, format="DD/MM/YYYY")
+    zid = zona_id_from_label(zlabel)
+    df = df_checklists_filtrado(status, periodicidade, grupo, zid, inicio, fim)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        out = BytesIO()
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="checklists")
+        st.download_button("Baixar Excel", out.getvalue(), file_name=f"simoc_relatorio_{hoje_brasilia().isoformat()}.xlsx")
+    with col2:
+        if REPORTLAB_OK:
+            st.download_button("Baixar PDF", gerar_pdf(df), file_name=f"simoc_relatorio_{hoje_brasilia().isoformat()}.pdf")
+        else:
+            st.info("PDF indisponível: reportlab não instalado.")
+
+
+def pagina_backup():
+    st.subheader("Backup e restauração")
+    tabelas = ["simoc_zonas", "simoc_usuarios", "simoc_atividades", "simoc_checklists", "simoc_mensagens", "simoc_auditoria"]
+    if st.button("Gerar backup JSON completo"):
+        data = {"gerado_em": fmt_data(agora_brasilia()), "tabelas": {}}
+        for t in tabelas:
+            data["tabelas"][t] = rows(f"select * from {t}")
+            # converter datas para string
+            for row in data["tabelas"][t]:
+                for k, v in list(row.items()):
+                    if isinstance(v, (datetime, date)):
+                        row[k] = fmt_data(v)
+        payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        registrar_auditoria("gerar_backup", "backup", detalhe="json")
+        st.download_button("Baixar backup", payload, file_name=f"simoc_backup_{hoje_brasilia().isoformat()}.json", mime="application/json")
+    st.markdown("---")
+    st.warning("Restauração é operação sensível. Faça apenas se tiver certeza e com backup anterior salvo.")
+    uploaded = st.file_uploader("Arquivo JSON de backup", type=["json"])
+    confirm = st.text_input("Digite CONFIRMO RESTAURAR para habilitar a restauração")
+    if uploaded and confirm == "CONFIRMO RESTAURAR" and st.button("Restaurar backup"):
+        st.error("Restauração automática foi bloqueada nesta versão para evitar perda acidental. Use o backup para auditoria/exportação ou peça uma rotina assistida de restauração.")
+
+
+def pagina_auditoria():
+    st.subheader("Auditoria")
+    df = dataframe("""
+        select a.id, u.email as usuario, a.acao, a.entidade, a.entidade_id, a.detalhe, a.criado_em
+        from simoc_auditoria a left join simoc_usuarios u on u.id=a.usuario_id
+        order by a.criado_em desc limit 500
+    """)
+    if not df.empty:
+        df["criado_em"] = df["criado_em"].apply(fmt_data)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
 
 # ============================================================
-# MAIN
+# PAGINAS ZONA
 # ============================================================
+
+def pagina_inicio_zona():
+    u = usuario_logado() or {}
+    zid = u.get("zona_id")
+    atras = scalar("select count(*) from simoc_checklists where zona_id=:z and status in ('pendente','devolvido') and prazo_preenchimento < :h", {"z": zid, "h": hoje_brasilia()}) or 0
+    pend = scalar("select count(*) from simoc_checklists where zona_id=:z and status in ('pendente','devolvido')", {"z": zid}) or 0
+    msgs = scalar("select count(*) from simoc_mensagens where zona_id=:z and lida_em is null", {"z": zid}) or 0
+    c1,c2,c3 = st.columns(3)
+    with c1: metric_card("Pendentes/devolvidos", pend)
+    with c2: metric_card("Atrasados", atras)
+    with c3: metric_card("Mensagens não lidas", msgs)
+    if atras:
+        alert("danger", "Há checklist em atraso. Regularize ou registre observação para a Corregedoria.")
+    c1, c2 = st.columns(2)
+    with c1:
+        card("✅ Checklist da Zona", "Visualizar atividades cadastradas pela Corregedoria, informar responsável local, marcar realização e registrar observações.")
+        if st.button("Abrir checklist", key="zona_home_check"):
+            st.session_state.nav_zona = "Checklist"
+            st.rerun()
+    with c2:
+        card("✉️ Mensagens da Corregedoria", "Ler orientações, alertas automáticos de atraso e comunicações enviadas pela Corregedoria.")
+        if st.button("Abrir mensagens", key="zona_home_msg"):
+            st.session_state.nav_zona = "Mensagens"
+            st.rerun()
+
+
+def pagina_checklist_zona():
+    u = usuario_logado() or {}
+    zid = u.get("zona_id")
+    st.subheader("Checklist da Zona")
+    itens = rows("""
+        select c.id, a.descricao, a.grupo, a.periodicidade, a.orientacao, a.exige_evidencia,
+               c.periodo_inicio, c.periodo_fim, c.prazo_preenchimento, c.status,
+               c.responsavel_zona, c.realizado, c.data_execucao, c.observacao_zona, c.evidencia_url, c.comentario_corregedoria
+        from simoc_checklists c join simoc_atividades a on a.id=c.atividade_id
+        where c.zona_id=:z and c.status in ('pendente','devolvido')
+        order by c.prazo_preenchimento, a.descricao
+    """, {"z": zid})
+    if not itens:
+        st.info("Não há atividades pendentes para esta Zona.")
+        return
+    for r in itens:
+        atrasado = r["prazo_preenchimento"] < hoje_brasilia()
+        titulo = f"{r['descricao']} | {r['periodicidade']} | prazo {fmt_data(r['prazo_preenchimento'])}"
+        with st.expander(titulo, expanded=atrasado):
+            if atrasado:
+                alert("danger", "Prazo vencido. A Corregedoria visualizará esta pendência e o sistema gerará alerta.")
+            if r.get("comentario_corregedoria"):
+                alert("warn", f"Comentário da Corregedoria: {r['comentario_corregedoria']}")
+            st.write(f"**Grupo:** {r['grupo']}")
+            st.write(f"**Período de execução:** {fmt_data(r['periodo_inicio'])} a {fmt_data(r['periodo_fim'])}")
+            if r.get("orientacao"):
+                st.info(r["orientacao"])
+            with st.form(f"form_check_{r['id']}"):
+                resp = st.text_input("Responsável pela atividade na Zona", value=r.get("responsavel_zona") or "")
+                realizado = st.checkbox("Atividade realizada", value=bool(r.get("realizado")))
+                data_exec = st.date_input("Data de execução/conferência", value=r.get("data_execucao") or hoje_brasilia(), format="DD/MM/YYYY")
+                obs = st.text_area("Observações da Zona", value=r.get("observacao_zona") or "")
+                evid = st.text_input("Link da evidência, SEI ou comprovante", value=r.get("evidencia_url") or "")
+                enviar = st.form_submit_button("Enviar checklist para a Corregedoria", type="primary")
+            if enviar:
+                if not resp.strip():
+                    st.warning("Informe o responsável pela atividade na Zona.")
+                elif not realizado:
+                    st.warning("Marque a atividade como realizada ou registre observação justificando antes de enviar.")
+                elif r.get("exige_evidencia") and not evid.strip():
+                    st.warning("Esta atividade exige evidência/link SEI.")
+                else:
+                    execute("""
+                        update simoc_checklists set responsavel_zona=:resp, realizado=:realizado, data_execucao=:data_exec,
+                        observacao_zona=:obs, evidencia_url=:evid, status='em_analise', enviado_em=now(), atualizado_em=now()
+                        where id=:id and zona_id=:z
+                    """, {"resp": resp.strip(), "realizado": realizado, "data_exec": data_exec, "obs": obs.strip(), "evid": evid.strip(), "id": r["id"], "z": zid})
+                    registrar_auditoria("enviar_checklist_zona", "simoc_checklists", r["id"], resp.strip())
+                    st.success("Checklist enviado à Corregedoria para visualização/validação.")
+                    st.rerun()
+
+
+def pagina_mensagens_zona():
+    u = usuario_logado() or {}
+    zid = u.get("zona_id")
+    st.subheader("Mensagens da Corregedoria")
+    msgs = rows("""
+        select id, titulo, mensagem, tipo, criada_em, lida_em
+        from simoc_mensagens where zona_id=:z order by criada_em desc limit 200
+    """, {"z": zid})
+    if not msgs:
+        st.info("Não há mensagens para esta Zona.")
+        return
+    for m in msgs:
+        with st.expander(f"{m['titulo']} · {fmt_data(m['criada_em'])} · {m['tipo']}"):
+            st.write(m["mensagem"])
+            if m.get("lida_em"):
+                st.caption(f"Lida em {fmt_data(m['lida_em'])}")
+            else:
+                if st.button("Marcar como lida", key=f"lida_{m['id']}"):
+                    execute("update simoc_mensagens set lida_em=now() where id=:id and zona_id=:z", {"id": m["id"], "z": zid})
+                    st.rerun()
+
+
+# ============================================================
+# APP PRINCIPAL
+# ============================================================
+
+def app_corregedoria():
+    paginas = ["Início", "Atividades", "Acompanhamento", "Validação", "Mensagens", "Zonas", "Relatórios", "Usuários", "Backup", "Auditoria"]
+    pagina = nav(paginas, "nav_cor")
+    if pagina == "Início": pagina_inicio_corregedoria()
+    elif pagina == "Atividades": pagina_atividades()
+    elif pagina == "Acompanhamento": pagina_acompanhamento()
+    elif pagina == "Validação": pagina_validacao()
+    elif pagina == "Mensagens": pagina_mensagens_corregedoria()
+    elif pagina == "Zonas": pagina_zonas()
+    elif pagina == "Relatórios": pagina_relatorios()
+    elif pagina == "Usuários": pagina_usuarios()
+    elif pagina == "Backup": pagina_backup()
+    elif pagina == "Auditoria": pagina_auditoria()
+
+
+def app_zona():
+    paginas = ["Início", "Checklist", "Mensagens"]
+    pagina = nav(paginas, "nav_zona")
+    if pagina == "Início": pagina_inicio_zona()
+    elif pagina == "Checklist": pagina_checklist_zona()
+    elif pagina == "Mensagens": pagina_mensagens_zona()
+
 
 def main():
-    if "user" not in st.session_state:
-        login_box()
+    if not usuario_logado():
+        tela_login()
         return
-    if not garantir_banco():
-        return
+    bootstrap_schema_once()
     header()
-    pages = nav_pages()
-    page = st.radio("Navegação", pages, horizontal=True, label_visibility="collapsed")
-    st.divider()
-    if page == "Início" and eh_corregedoria():
-        page_inicio_corregedoria()
-    elif page == "Início" and eh_zona():
-        page_inicio_zona()
-    elif page == "Atividades":
-        page_atividades()
-    elif page == "Acompanhamento":
-        page_acompanhamento()
-    elif page == "Validar":
-        page_validacao()
-    elif page == "Zonas":
-        page_zonas()
-    elif page == "Checklist":
-        page_checklist_zona()
-    elif page == "Orientações":
-        page_orientacoes()
-    elif page == "Relatórios":
-        page_relatorios()
-    elif page == "Backup":
-        page_backup()
-    elif page == "Usuários":
-        page_usuarios()
-    elif page == "Auditoria":
-        page_auditoria()
+    col1, col2 = st.columns([8, 1])
+    with col1: user_strip()
+    with col2:
+        if st.button("Sair"):
+            registrar_auditoria("logout", "simoc_usuarios", usuario_logado().get("id"))
+            st.session_state.clear()
+            st.rerun()
+    if eh_corregedoria():
+        app_corregedoria()
+    elif eh_zona():
+        app_zona()
+    else:
+        st.error("Perfil não autorizado.")
 
 
 if __name__ == "__main__":
