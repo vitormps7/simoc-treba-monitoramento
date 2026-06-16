@@ -924,14 +924,38 @@ def user_strip():
 
 
 def set_page(key: str, page: str):
-    st.session_state[key] = page
+    """Agenda a mudança de página a partir de botões/cards.
+
+    Não alteramos diretamente a chave do radio depois que ele já foi criado
+    na execução atual. Isso evita StreamlitAPIException e evita que o radio
+    volte para a página anterior. O destino fica pendente e é aplicado no
+    começo do próximo rerun, antes da criação do radio.
+    """
+    st.session_state[f"{key}_pending"] = page
+    st.rerun()
 
 
 def nav(paginas: list[str], key: str) -> str:
-    if key not in st.session_state or st.session_state[key] not in paginas:
-        st.session_state[key] = paginas[0]
     widget_key = f"{key}_widget"
-    idx = paginas.index(st.session_state[key])
+    pending_key = f"{key}_pending"
+
+    if pending_key in st.session_state:
+        alvo = st.session_state.pop(pending_key)
+        if alvo in paginas:
+            st.session_state[key] = alvo
+            st.session_state[widget_key] = alvo
+
+    if widget_key in st.session_state and st.session_state[widget_key] in paginas:
+        alvo = st.session_state[widget_key]
+    elif key in st.session_state and st.session_state[key] in paginas:
+        alvo = st.session_state[key]
+        st.session_state[widget_key] = alvo
+    else:
+        alvo = paginas[0]
+        st.session_state[key] = alvo
+        st.session_state[widget_key] = alvo
+
+    idx = paginas.index(alvo)
     st.markdown("<div class='nav-box'>", unsafe_allow_html=True)
     pagina = st.radio("Navegação", paginas, horizontal=True, index=idx, key=widget_key, label_visibility="collapsed")
     st.markdown("</div>", unsafe_allow_html=True)
@@ -946,7 +970,8 @@ def card(titulo: str, texto: str):
 def action_card(titulo: str, texto: str, botao: str, destino: str, nav_key: str = "nav_cor", button_key: str | None = None):
     with st.container(border=True):
         card(titulo, texto)
-        st.button(botao, key=button_key or f"btn_{nav_key}_{destino}", on_click=set_page, args=(nav_key, destino))
+        if st.button(botao, key=button_key or f"btn_{nav_key}_{destino}", use_container_width=True):
+            set_page(nav_key, destino)
 
 
 def metric_card(label: str, value: Any):
